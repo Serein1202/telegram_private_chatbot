@@ -30,14 +30,9 @@ const CONFIG = {
     FILTER_GRAY_SCORE: 20,               // 达到该值进入灰区，交给 AI 仲裁
     FILTER_STRIKE_LIMIT: 3,              // 累计违规达到该次数自动封禁
     FILTER_STRIKE_TTL_SECONDS: 604800,   // 违规计数窗口 7 天
-    // AI 仲裁模型回退列表：依次尝试，第一个成功即用
-    // 2026-05-30 Cloudflare 退役了 llama-3.1/3.3 等基础版模型，-fast 变体仍存活；
-    // 官方推荐替代：glm-4.7-flash（快、中文好）、gemma-4-26b。注意 kimi/GLM-5.2/deepseek 需付费计划，勿用。
+    // AI 仲裁模型（glm-4.7-flash：官方推荐替代，快，中文理解力好，免费额度可用）
     AI_MODELS: [
-        "@cf/zai-org/glm-4.7-flash",
-        "@cf/meta/llama-3.1-8b-instruct-fast",
-        "@cf/google/gemma-4-26b-a4b-it",
-        "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+        "@cf/zai-org/glm-4.7-flash"
     ]
 };
 
