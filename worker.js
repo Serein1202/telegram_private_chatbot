@@ -30,7 +30,12 @@ const CONFIG = {
     FILTER_GRAY_SCORE: 20,               // 达到该值进入灰区，交给 AI 仲裁
     FILTER_STRIKE_LIMIT: 3,              // 累计违规达到该次数自动封禁
     FILTER_STRIKE_TTL_SECONDS: 604800,   // 违规计数窗口 7 天
-    AI_MODEL: "@cf/meta/llama-3.1-8b-instruct"
+    // AI 仲裁模型回退列表：依次尝试，第一个成功即用（防止单一模型被下线导致灰区仲裁失效）
+    AI_MODELS: [
+        "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "@cf/meta/llama-4-scout-17b-16e-instruct",
+        "@cf/meta/llama-3.1-8b-instruct"
+    ]
 };
 
 // 线程健康检查缓存，减少频繁探测请求
@@ -672,7 +677,7 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
         try {
             await tgCall(env, "sendMessage", withMessageThreadId({
                 chat_id: env.SUPERGROUP_ID,
-                text: `⚠️ **可疑消息提醒**\n用户: [${userId}](tg://user?id=${userId})\n特征: ${filterResult.reasons.slice(0, 3).join("、")}\n（AI 仲裁不可用，请自行甄别下方消息）`,
+                text: `⚠️ **可疑消息提醒**\n用户: [${userId}](tg://user?id=${userId})\n特征: ${filterResult.reasons.slice(0, 3).join("、")}\n（AI 仲裁失败: ${filterResult.aiError || "未知原因"}，请自行甄别下方消息）`,
                 parse_mode: "Markdown"
             }, rec.thread_id));
         } catch (e) {
@@ -1583,30 +1588,40 @@ function analyzeContentSignals(msg) {
 
 /**
  * AI 层：Workers AI（llama）对灰区消息做语义仲裁。
- * 未绑定 AI 或调用失败时返回 null，交由调用方降级处理。
+ * 依次尝试 AI_MODELS 中的模型，任一成功即返回判定结果。
+ * 全部失败时返回 { error: 具体原因 }，交由调用方降级处理并透出错误信息。
  */
 async function aiClassifySpam(env, text) {
-    if (!env.AI) return null;
-    try {
-        const result = await env.AI.run(CONFIG.AI_MODEL, {
-            messages: [
-                {
-                    role: "system",
-                    content: "你是消息安全审核助手。判断下面的 Telegram 私聊消息是否属于垃圾广告、引流推广、诈骗或色情骚扰内容。只输出 JSON，不要输出其他文字，格式：{\"spam\": true, \"reason\": \"简短原因\"} 或 {\"spam\": false, \"reason\": \"\"}"
-                },
-                { role: "user", content: text.slice(0, 500) }
-            ],
-            max_tokens: 120
-        });
-        const raw = ((result && result.response) || "").trim();
-        const match = raw.match(/\{[\s\S]*\}/);
-        if (!match) return null;
-        const parsed = JSON.parse(match[0]);
-        return { spam: !!parsed.spam, reason: parsed.reason || "" };
-    } catch (e) {
-        Logger.warn('ai_classify_failed', { message: e instanceof Error ? e.message : String(e) });
-        return null;
+    if (!env.AI) return { error: "AI binding 未绑定" };
+    let lastErr = "";
+    for (const model of CONFIG.AI_MODELS) {
+        try {
+            const result = await env.AI.run(model, {
+                messages: [
+                    {
+                        role: "system",
+                        content: "你是消息安全审核助手。判断下面的 Telegram 私聊消息是否属于垃圾广告、引流推广、诈骗或色情骚扰内容。只输出 JSON，不要输出其他文字，格式：{\"spam\": true, \"reason\": \"简短原因\"} 或 {\"spam\": false, \"reason\": \"\"}"
+                    },
+                    { role: "user", content: text.slice(0, 500) }
+                ],
+                max_tokens: 120
+            });
+            // 兼容不同模型的返回结构（response 或 result.response）
+            const raw = String(
+                (result && (result.response ?? (result.result && result.result.response))) || ""
+            ).trim();
+            const match = raw.match(/\{[\s\S]*\}/);
+            if (!match) {
+                lastErr = `${model} 响应无法解析: ${raw.slice(0, 80)}`;
+                continue;
+            }
+            const parsed = JSON.parse(match[0]);
+            return { spam: !!parsed.spam, reason: parsed.reason || "" };
+        } catch (e) {
+            lastErr = `${model}: ${e instanceof Error ? e.message : String(e)}`;
+        }
     }
+    return { error: lastErr || "AI 无响应" };
 }
 
 /**
@@ -1627,13 +1642,14 @@ async function filterMessage(msg, env) {
 
     if (signals.score >= CONFIG.FILTER_GRAY_SCORE && signals.text) {
         const ai = await aiClassifySpam(env, signals.text);
-        if (ai) {
+        if (ai && ai.error === undefined) {
             if (ai.spam) {
                 return { action: "block", reasons: [ai.reason || "AI 判定为广告/垃圾内容"] };
             }
             return { action: "pass", reasons: [] };
         }
-        return { action: "flag", reasons: signals.reasons };
+        // AI 不可用：返回 flag（转发但提醒管理员），并携带失败原因
+        return { action: "flag", reasons: signals.reasons, aiError: (ai && ai.error) || "AI 仲裁未生效" };
     }
 
     return { action: "pass", reasons: signals.reasons };
