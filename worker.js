@@ -27,13 +27,9 @@ const CONFIG = {
     TURNSTILE_INITDATA_MAX_AGE: 3600,    // initData 签名最大时效 1 小时
     // ---- 智能内容过滤 ----
     FILTER_BLOCK_SCORE: 60,             // 规则评分达到该值直接拦截
-    FILTER_GRAY_SCORE: 20,               // 达到该值进入灰区，交给 AI 仲裁
+    FILTER_GRAY_SCORE: 20,               // 达到该值进入灰区（转发但提醒管理员甄别）
     FILTER_STRIKE_LIMIT: 3,              // 累计违规达到该次数自动封禁
-    FILTER_STRIKE_TTL_SECONDS: 604800,   // 违规计数窗口 7 天
-    // AI 仲裁模型（glm-4.7-flash：官方推荐替代，快，中文理解力好，免费额度可用）
-    AI_MODELS: [
-        "@cf/zai-org/glm-4.7-flash"
-    ]
+    FILTER_STRIKE_TTL_SECONDS: 604800   // 违规计数窗口 7 天
 };
 
 // 线程健康检查缓存，减少频繁探测请求
@@ -393,7 +389,6 @@ export default {
                 kv_bound: !!env.TOPIC_MAP,
                 bot_token_set: !!env.BOT_TOKEN,
                 supergroup_id_set: !!env.SUPERGROUP_ID,
-                workers_ai_bound: !!env.AI,
                 turnstile_sitekey_set: !!env.TURNSTILE_SITEKEY,
                 turnstile_secret_set: !!env.TURNSTILE_SECRET
             }, null, 2), { headers: { "content-type": "application/json" } });
@@ -639,7 +634,7 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
     }
 
     // ---- 智能内容过滤：识别广告/引流/不良内容，拦截并警告 ----
-    const filterResult = await filterMessage(msg, env);
+    const filterResult = filterMessage(msg);
     if (filterResult.action === "block") {
         const strikeKey = `strikes:${userId}`;
         const strikes = parseInt(await env.TOPIC_MAP.get(strikeKey) || "0") + 1;
@@ -671,11 +666,11 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
         return;
     }
     if (filterResult.action === "flag") {
-        // 灰区消息：无法 AI 仲裁时照常转发，但提前向管理员提示可疑特征
+        // 灰区消息：命中中危特征，照常转发，但提前向管理员提示可疑特征以便甄别
         try {
             await tgCall(env, "sendMessage", withMessageThreadId({
                 chat_id: env.SUPERGROUP_ID,
-                text: `⚠️ **可疑消息提醒**\n用户: [${userId}](tg://user?id=${userId})\n特征: ${filterResult.reasons.slice(0, 3).join("、")}\n（AI 仲裁失败: ${String(filterResult.aiError || "未知原因").slice(0, 200)}，请自行甄别下方消息）`,
+                text: `⚠️ **可疑消息提醒**\n用户: [${userId}](tg://user?id=${userId})\n特征: ${filterResult.reasons.slice(0, 3).join("、")}\n（命中可疑特征，请自行甄别下方消息）`,
                 parse_mode: "Markdown"
             }, rec.thread_id));
         } catch (e) {
@@ -1585,65 +1580,12 @@ function analyzeContentSignals(msg) {
 }
 
 /**
- * AI 层：Workers AI 对灰区消息做语义仲裁。
- * 依次尝试 AI_MODELS 中的模型，任一成功即返回判定结果。
- * 全部失败时返回 { error: 所有模型的失败原因汇总 }，交由调用方降级处理并透出错误信息。
- */
-async function aiClassifySpam(env, text) {
-    if (!env.AI) return { error: "AI binding 未绑定" };
-    const errors = [];
-    for (const model of CONFIG.AI_MODELS) {
-        try {
-            const result = await env.AI.run(model, {
-                messages: [
-                    {
-                        role: "system",
-                        content: "你是 Telegram 客服机器人的消息安全审核助手，判断用户发来的私聊消息是否属于垃圾广告、引流推广、诈骗或色情骚扰。\n\n" +
-                            "判定为垃圾（spam=true）：\n" +
-                            "- 推广话术本身：提及兼职刷单、返利、宝妈兼职、带你赚钱、日入过万、稳赚等，即使没有留联系方式也算\n" +
-                            "- 引流：微信号/QQ号/手机号/t.me链接/要求加群或私聊\n" +
-                            "- 赌博、色情、虚拟币投资、贷款、代开发票等违法或灰色推广\n" +
-                            "- 消息的主旨是在推销、招揽或撒网\n\n" +
-                            "判定为正常（spam=false）：\n" +
-                            "- 咨询产品、价格、售后等业务问题\n" +
-                            "- 正常问候和闲聊\n" +
-                            "- 用户陈述自己被骗的经历（如\"我之前刷单被骗了，想咨询怎么追回\"）\n\n" +
-                            "宁枉勿纵：拿不准时倾向判 spam=true。\n" +
-                            "只输出 JSON，不要输出其他文字，格式：{\"spam\": true, \"reason\": \"简短原因\"} 或 {\"spam\": false, \"reason\": \"\"}"
-                    },
-                    { role: "user", content: text.slice(0, 500) }
-                ],
-                // 注意：glm-4.7-flash 是推理模型，预算需覆盖思维链+正文；
-                // max_tokens 已废弃（官方要求改用 max_completion_tokens），预算过小会导致正文为空
-                max_completion_tokens: 500
-            });
-            // 兼容不同模型的返回结构（response 或 result.response）
-            const raw = String(
-                (result && (result.response ?? (result.result && result.result.response))) || ""
-            ).trim();
-            const match = raw.match(/\{[\s\S]*\}/);
-            if (!match) {
-                // 透出原始返回结构，便于定位字段差异或 token 耗尽问题
-                const dump = raw ? raw.slice(0, 60) : JSON.stringify(result).slice(0, 150);
-                errors.push(`${model} 响应无法解析: ${dump}`);
-                continue;
-            }
-            const parsed = JSON.parse(match[0]);
-            return { spam: !!parsed.spam, reason: parsed.reason || "" };
-        } catch (e) {
-            errors.push(`${model}: ${(e instanceof Error ? e.message : String(e)).slice(0, 100)}`);
-        }
-    }
-    return { error: errors.join(" | ") || "AI 无响应" };
-}
-
-/**
- * 统一过滤入口：
+ * 统一过滤入口（纯本地规则，无 AI）：
  * - 评分 >= FILTER_BLOCK_SCORE  → block（拦截 + 警告 + 计次）
- * - 评分 >= FILTER_GRAY_SCORE   → AI 仲裁：判垃圾则 block，判正常则 pass，AI 不可用则 flag（转发但提醒管理员）
+ * - 评分 >= FILTER_GRAY_SCORE   → flag（照常转发，但提醒管理员甄别）
  * - 其他                        → pass
  */
-async function filterMessage(msg, env) {
+function filterMessage(msg) {
     const signals = analyzeContentSignals(msg);
 
     if (signals.score >= CONFIG.FILTER_BLOCK_SCORE) {
@@ -1653,16 +1595,8 @@ async function filterMessage(msg, env) {
         };
     }
 
-    if (signals.score >= CONFIG.FILTER_GRAY_SCORE && signals.text) {
-        const ai = await aiClassifySpam(env, signals.text);
-        if (ai && ai.error === undefined) {
-            if (ai.spam) {
-                return { action: "block", reasons: [ai.reason || "AI 判定为广告/垃圾内容"] };
-            }
-            return { action: "pass", reasons: [] };
-        }
-        // AI 不可用：返回 flag（转发但提醒管理员），并携带失败原因
-        return { action: "flag", reasons: signals.reasons, aiError: (ai && ai.error) || "AI 仲裁未生效" };
+    if (signals.score >= CONFIG.FILTER_GRAY_SCORE) {
+        return { action: "flag", reasons: signals.reasons };
     }
 
     return { action: "pass", reasons: signals.reasons };

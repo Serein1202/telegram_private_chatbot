@@ -38,7 +38,7 @@ const cases = [
     console.log('阈值: block>=' + CONFIG.FILTER_BLOCK_SCORE + ', gray>=' + CONFIG.FILTER_GRAY_SCORE, '\n');
     for (const [name, msg] of cases) {
         const s = analyzeContentSignals(msg);
-        const f = await filterMessage(msg, {}); // 无 AI 绑定 → 灰区走 flag
+        const f = filterMessage(msg); // 纯本地规则：block / flag / pass
         console.log(`[${name}] 评分=${s.score}  判定=${f.action}`);
         if (s.reasons.length) console.log('   特征:', s.reasons.join('、'));
     }

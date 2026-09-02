@@ -1,4 +1,4 @@
-name = "telegram_private_chatbot"
+name = 'telegram-private-chatbot'
 main = "worker.js"
 compatibility_date = "2024-11-30"
 
@@ -12,10 +12,6 @@ keep_vars = true
 [[kv_namespaces]]
 binding = "TOPIC_MAP"
 id = "5fa2dd14a6414d428ad8ab30309f678b"
-
-# 智能内容过滤：绑定 Workers AI（对灰区消息做语义仲裁，降低误判）
-[ai]
-binding = "AI"
 
 # 建议在 Cloudflare 后台 Worker Settings -> Variables 中配置：
 #   必需：BOT_TOKEN、SUPERGROUP_ID（keep_vars = true 可保护这些变量不被部署清除）
