@@ -1602,7 +1602,9 @@ async function aiClassifySpam(env, text) {
                     },
                     { role: "user", content: text.slice(0, 500) }
                 ],
-                max_tokens: 120
+                // 注意：glm-4.7-flash 是推理模型，预算需覆盖思维链+正文；
+                // max_tokens 已废弃（官方要求改用 max_completion_tokens），预算过小会导致正文为空
+                max_completion_tokens: 500
             });
             // 兼容不同模型的返回结构（response 或 result.response）
             const raw = String(
@@ -1610,7 +1612,9 @@ async function aiClassifySpam(env, text) {
             ).trim();
             const match = raw.match(/\{[\s\S]*\}/);
             if (!match) {
-                errors.push(`${model} 响应无法解析: ${raw.slice(0, 60)}`);
+                // 透出原始返回结构，便于定位字段差异或 token 耗尽问题
+                const dump = raw ? raw.slice(0, 60) : JSON.stringify(result).slice(0, 150);
+                errors.push(`${model} 响应无法解析: ${dump}`);
                 continue;
             }
             const parsed = JSON.parse(match[0]);
