@@ -4,7 +4,6 @@
 const CONFIG = {
     VERIFY_ID_LENGTH: 12,
     VERIFY_EXPIRE_SECONDS: 300,         // 5分钟
-    VERIFIED_EXPIRE_SECONDS: 2592000,   // 30天
     MEDIA_GROUP_EXPIRE_SECONDS: 60,
     MEDIA_GROUP_DELAY_MS: 3000,         // 3秒（从2秒增加）
     PENDING_MAX_MESSAGES: 10,           // 验证期间最多暂存的消息数
@@ -24,7 +23,6 @@ const CONFIG = {
     THREAD_HEALTH_TTL_MS: 60000,
     // ---- Turnstile 人机验证 ----
     TURNSTILE_LINK_TTL_SECONDS: 300,     // 验证链接有效期 5 分钟
-    TURNSTILE_INITDATA_MAX_AGE: 3600,    // initData 签名最大时效 1 小时
     // ---- 智能内容过滤 ----
     FILTER_BLOCK_SCORE: 60,             // 规则评分达到该值直接拦截
     FILTER_GRAY_SCORE: 20,               // 达到该值进入灰区（转发但提醒管理员甄别）
@@ -180,6 +178,10 @@ function isTestMessageInvalid(description) {
            desc.includes("bad request: message text is empty");
 }
 
+/**
+ * 获取或创建用户话题记录，带并发保护（topicCreateInFlight）：
+ * 同一实例内同一用户并发请求只触发一次 createForumTopic，避免重复建话题。
+ */
 async function getOrCreateUserTopicRec(from, key, env, userId) {
     const existing = await safeGetJSON(env, key, null);
     if (existing && existing.thread_id) return existing;
@@ -209,6 +211,10 @@ function withMessageThreadId(body, threadId) {
     return { ...body, message_thread_id: threadId };
 }
 
+/**
+ * 话题健康探测：向话题发送一条临时消息（🔎）并立即删除，根据返回判断话题是否仍存在。
+ * 返回 status：ok / missing / redirected / probe_invalid / missing_thread_id / unknown_error
+ */
 async function probeForumThread(env, expectedThreadId, { userId, reason, doubleCheckOnMissingThreadId = true } = {}) {
     const attemptOnce = async () => {
         const res = await tgCall(env, "sendMessage", {
@@ -265,6 +271,10 @@ async function probeForumThread(env, expectedThreadId, { userId, reason, doubleC
     return second;
 }
 
+/**
+ * 话题丢失时重置用户验证状态并强制重新验证：
+ * 清理 verified / 旧话题映射 / 健康缓存，标记 needs_verify，再重新发起验证。
+ */
 async function resetUserVerificationAndRequireReverify(env, { userId, userKey, oldThreadId, pendingMsgId, reason }) {
     // 清理旧映射与验证状态：用户需要重新做人机验证
     await env.TOPIC_MAP.delete(`verified:${userId}`);
@@ -380,21 +390,6 @@ async function checkRateLimit(userId, env, action = 'message', limit = 20, windo
 
 export default {
   async fetch(request, env, ctx) {
-    // ---- 临时诊断接口：报告当前部署实际可见的配置（仅布尔值，不泄露任何密钥）----
-    // 排查环境变量问题用，问题解决后可整段删除
-    {
-        const dbgUrl = new URL(request.url);
-        if (dbgUrl.pathname === "/debug/env") {
-            return new Response(JSON.stringify({
-                kv_bound: !!env.TOPIC_MAP,
-                bot_token_set: !!env.BOT_TOKEN,
-                supergroup_id_set: !!env.SUPERGROUP_ID,
-                turnstile_sitekey_set: !!env.TURNSTILE_SITEKEY,
-                turnstile_secret_set: !!env.TURNSTILE_SECRET
-            }, null, 2), { headers: { "content-type": "application/json" } });
-        }
-    }
-
     // 环境自检
     if (!env.TOPIC_MAP) return new Response("Error: KV 'TOPIC_MAP' not bound.");
     if (!env.BOT_TOKEN) return new Response("Error: BOT_TOKEN not set.");
@@ -504,6 +499,14 @@ export default {
 
 // ---------------- 核心业务逻辑 ----------------
 
+/**
+ * 私聊消息主入口：
+ * 1. 速率限制检查
+ * 2. 拦截普通用户发送的指令（`/` 开头，`/start` 除外）
+ * 3. 封禁用户直接忽略
+ * 4. 未验证 → 发起人机验证（验证期间的消息暂存，通过后补发）
+ * 5. 已验证 → 转发到管理员专属话题
+ */
 async function handlePrivateMessage(msg, env, ctx) {
   const userId = msg.chat.id;
   const key = `user:${userId}`;
@@ -539,6 +542,12 @@ async function handlePrivateMessage(msg, env, ctx) {
   await forwardToTopic(msg, userId, key, env, ctx);
 }
 
+/**
+ * 将用户消息转发到其专属话题：
+ * - 先执行内容过滤（filterMessage），广告/不良内容拦截不转发并计违规
+ * - 话题缺失时自动创建 + 健康探测，异常时重置验证
+ * - 返回实际动作 "pass" / "flag" / "blocked"（供补发计数使用）
+ */
 async function forwardToTopic(msg, userId, key, env, ctx) {
     // 并发兜底：如果已被标记为需要重新验证，直接发起验证并暂停转发/建话题
     const needsVerify = await env.TOPIC_MAP.get(`needs_verify:${userId}`);
@@ -793,6 +802,12 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
     return filterResult.action;
 }
 
+/**
+ * 管理员在群组话题内发起的指令与回信处理：
+ * - 仅管理员可操作，先反查话题对应的 userId
+ * - 处理 /help /cleanup /close /open /reset /trust /ban /unban /info 指令
+ * - 非指令消息则转发（回信）给对应用户
+ */
 async function handleAdminReply(msg, env, ctx) {
   const threadId = msg.message_thread_id;
   const text = (msg.text || "").trim();
@@ -800,6 +815,30 @@ async function handleAdminReply(msg, env, ctx) {
 
   // 仅允许管理员在群内操作与回信，防止任意群成员向用户私聊注入消息
   if (!senderId || !(await isAdminUser(env, senderId))) {
+      return;
+  }
+
+  // /help 命令：列出所有管理员指令及说明（不依赖具体话题，任意话题可用）
+  if (text === "/help") {
+      const helpText = [
+          "🤖 **管理员指令帮助**",
+          "",
+          "🛠️ **通用**",
+          "• `/help` — 显示本帮助信息",
+          "• `/cleanup` — 扫描并清理已失效的用户话题记录",
+          "",
+          "💬 **话题管理**（进入对应用户话题后使用）",
+          "• `/info` — 查看当前用户的信息与状态",
+          "• `/close` — 强制关闭当前话题的对话",
+          "• `/open` — 重新开启当前话题的对话",
+          "",
+          "🔒 **验证与封禁**（进入对应用户话题后使用）",
+          "• `/reset` — 重置该用户的验证状态（需重新验证）",
+          "• `/trust` — 设置该用户为永久信任",
+          "• `/ban` — 封禁该用户",
+          "• `/unban` — 解封该用户"
+      ].join("\n");
+      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: helpText, parse_mode: "Markdown" });
       return;
   }
 
@@ -901,6 +940,12 @@ async function handleAdminReply(msg, env, ctx) {
 
 // ---------------- 验证模块 (纯本地) ----------------
 
+/**
+ * 验证挑战分发入口：
+ * - 已配置 Turnstile → 走 Cloudflare Turnstile 人机验证
+ * - 未配置 → 兜底走本地题库验证
+ * pendingMsgId / pendingText 用于暂存验证期间的消息，通过后自动补发。
+ */
 async function sendVerificationChallenge(userId, env, pendingMsgId, pendingText) {
     // 优先使用 Cloudflare Turnstile 验证（配置 TURNSTILE_SITEKEY + TURNSTILE_SECRET 后生效）
     if (isTurnstileEnabled(env)) {
@@ -1010,6 +1055,11 @@ async function sendVerificationChallenge(userId, env, pendingMsgId, pendingText)
     });
 }
 
+/**
+ * 处理本地题库验证的回调（callback_query）：
+ * 解析 verify:<id>:<index>，校验答案正确后标记已验证并补发暂存消息。
+ * （Turnstile 验证走 web_app 回调，不经由此函数）
+ */
 async function handleCallbackQuery(query, env, ctx) {
     try {
         const data = query.data;
@@ -1076,8 +1126,8 @@ async function handleCallbackQuery(query, env, ctx) {
                 selectedOption: state.options[selectedIndex]
             });
 
-            // 30天有效期 - 使用配置常量
-            await env.TOPIC_MAP.put(`verified:${userId}`, "1", { expirationTtl: CONFIG.VERIFIED_EXPIRE_SECONDS });
+            // 验证通过后永久免验证（有问题的用户由管理员 /ban 处理）
+            await env.TOPIC_MAP.put(`verified:${userId}`, "1");
             await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
 
             // 【修复 #1】清理所有相关挑战
@@ -1254,7 +1304,7 @@ async function sendTurnstileChallenge(userId, env, pendingMsgId, pendingText) {
 
 /**
  * 渲染 Turnstile 验证页（由 Worker 直接托管）。
- * 页面在 Telegram 内置浏览器中打开，可读取 initData 用于身份绑定。
+ * 页面通过一次性链接令牌（t 参数）与用户绑定，身份安全由令牌 + siteverify 保证。
  */
 function buildTurnstilePage(env, expired) {
     const sitekey = String(env.TURNSTILE_SITEKEY).replace(/[^a-zA-Z0-9_-]/g, "");
@@ -1292,8 +1342,7 @@ function buildTurnstilePage(env, expired) {
               '    setStatus("正在校验，请稍候…", "");',
               '    var payload = {',
               '      t: new URLSearchParams(location.search).get("t"),',
-              '      cf: token,',
-              '      initData: (tg && tg.initData) ? tg.initData : ""',
+              '      cf: token',
               '    };',
               '    fetch("/turnstile/complete", {',
               '      method: "POST",',
@@ -1352,10 +1401,9 @@ async function handleTurnstilePage(request, env) {
 
 /**
  * Turnstile 完成回调：
- * 1. 校验一次性链接令牌（KV 中存在且未过期）
- * 2. 校验 Telegram initData HMAC 签名，确保是本人操作
- * 3. 调用 Cloudflare siteverify 校验挑战结果
- * 4. 标记 30 天免验证，补发暂存消息
+ * 1. 校验一次性链接令牌（KV 中存在且未过期，绑定 userId）
+ * 2. 调用 Cloudflare siteverify 校验挑战结果
+ * 3. 标记永久免验证，补发暂存消息（后台异步执行）
  */
 async function handleTurnstileComplete(request, env, ctx) {
     const jsonResp = (obj, status) => new Response(JSON.stringify(obj), {
@@ -1383,18 +1431,7 @@ async function handleTurnstileComplete(request, env, ctx) {
     }
     const userId = state.userId;
 
-    // 身份校验（软校验）：initData HMAC 校验失败时仅记录日志、不阻断流程。
-    // 安全性由一次性链接令牌（KV 绑定 userId、5 分钟过期）+ Turnstile siteverify 保证，
-    // initData 属于额外的第三层防线，参考 dydydd fork 的做法降级为可观察项。
-    const initData = String(body.initData || "");
-    if (initData) {
-        const v = await validateTelegramInitData(env, initData, userId);
-        if (!v.ok) {
-            Logger.warn('turnstile_initdata_invalid_soft', { userId, reason: v.reason, detail: v.detail || null });
-        }
-    }
-
-    // 调用 Cloudflare siteverify
+    // 调用 Cloudflare siteverify 校验挑战结果（身份绑定由一次性链接令牌保证）
     const form = new FormData();
     form.append("secret", String(env.TURNSTILE_SECRET));
     form.append("response", cfResponse);
@@ -1418,8 +1455,8 @@ async function handleTurnstileComplete(request, env, ctx) {
     await env.TOPIC_MAP.delete(stateKey);
     await env.TOPIC_MAP.delete(`user_challenge:${userId}`);
 
-    // 30 天免验证
-    await env.TOPIC_MAP.put(`verified:${userId}`, "1", { expirationTtl: CONFIG.VERIFIED_EXPIRE_SECONDS });
+    // 验证通过后永久免验证（有问题的用户由管理员 /ban 处理）
+    await env.TOPIC_MAP.put(`verified:${userId}`, "1");
     await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
 
     Logger.info('turnstile_verification_passed', { userId });
@@ -1477,71 +1514,6 @@ async function handleTurnstileComplete(request, env, ctx) {
     })());
 
     return jsonResp({ ok: true });
-}
-
-/**
- * 校验 Telegram WebApp initData 的 HMAC 签名（官方算法）：
- * secret_key = HMAC_SHA256(bot_token, "WebAppData")
- * hash       = HMAC_SHA256(secret_key, data_check_string)
- * 返回 { ok, reason, detail }，reason 标识具体失败环节（用于诊断）
- */
-async function validateTelegramInitData(env, initData, expectedUserId) {
-    try {
-        const params = new URLSearchParams(initData);
-        const hash = params.get("hash");
-        const authDate = parseInt(params.get("auth_date") || "0", 10);
-        if (!hash) return { ok: false, reason: "no_hash" };
-        if (!authDate) return { ok: false, reason: "no_auth_date" };
-        const age = Math.floor(Date.now() / 1000) - authDate;
-        if (age > CONFIG.TURNSTILE_INITDATA_MAX_AGE) return { ok: false, reason: "expired", detail: `auth_age=${age}s` };
-
-        const userRaw = params.get("user");
-        if (userRaw) {
-            const u = JSON.parse(userRaw);
-            if (Number(u.id) !== Number(expectedUserId)) return { ok: false, reason: "user_mismatch", detail: `initData_uid=${u.id} expected=${expectedUserId}` };
-        }
-
-        // 【修复 #29】排除 hash 与 signature（Telegram 直链启动 Mini App 时 initData 会附带 signature）
-        // 官方算法要求：构造 data-check-string 时 hash 和 signature 都必须从输入中移除
-        params.delete("hash");
-        params.delete("signature");
-
-        // data_check_string = 按 key 排序的 "k=v" 列表，用 \n 连接
-        const dataCheckString = [...params.entries()]
-            .sort(([a], [b]) => a.localeCompare(b))
-            .map(([k, v]) => `${k}=${v}`)
-            .join("\n");
-
-        const enc = new TextEncoder();
-        const botKey = await crypto.subtle.importKey(
-            "raw", enc.encode(String(env.BOT_TOKEN)),
-            { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
-        );
-        const secretBuf = await crypto.subtle.sign("HMAC", botKey, enc.encode("WebAppData"));
-        const secretKey = await crypto.subtle.importKey(
-            "raw", secretBuf,
-            { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
-        );
-        const calcBuf = await crypto.subtle.sign("HMAC", secretKey, enc.encode(dataCheckString));
-        const calc = [...new Uint8Array(calcBuf)].map(b => b.toString(16).padStart(2, "0")).join("");
-        if (calc !== hash) {
-            // 详细输出便于线上比对：
-            // - initData 原文前 200 字符（看是否被修改）
-            // - 期望 hash 与计算 hash 前 12 字符
-            // - data_check_string 完整内容（把 \n 替换为 | 以便单行显示）
-            const safeInit = (initData || "").slice(0, 200);
-            const safeDcs = dataCheckString.replace(/\n/g, "|");
-            return {
-                ok: false,
-                reason: "hmac_mismatch",
-                detail: `exp=${hash.slice(0,12)} calc=${calc.slice(0,12)} dcs[${safeDcs.length}]=${safeDcs.slice(0,160)} init[${initData.length}]=${safeInit}`
-            };
-        }
-        return { ok: true };
-    } catch (e) {
-        Logger.error('initdata_validate_failed', e);
-        return { ok: false, reason: "exception", detail: String(e && e.message) };
-    }
 }
 
 // ---------------- 智能内容过滤模块 ----------------
@@ -1956,6 +1928,10 @@ async function tgCall(env, method, body, timeout = CONFIG.API_TIMEOUT_MS) {
   }
 }
 
+/**
+ * 媒体组消息处理：将同一 media_group_id 的多条媒体暂存到 KV，
+ * 延迟 MEDIA_GROUP_DELAY_MS 后合并为一条 sendMediaGroup 发送，避免媒体组被拆散。
+ */
 async function handleMediaGroup(msg, env, ctx, { direction, targetChat, threadId }) {
     const groupId = msg.media_group_id;
     const key = `mg:${direction}:${groupId}`;

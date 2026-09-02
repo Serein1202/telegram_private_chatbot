@@ -1,4 +1,4 @@
-# 🛡️ TeleGuard (v4.0)
+# 🤖 Telegram Private Chatbot (v5.4)
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/jikssha/telegram_private_chatbot)
 ![GitHub stars](https://img.shields.io/github/stars/jikssha/telegram_private_chatbot?style=social)
@@ -7,7 +7,7 @@
 
 [🇺🇸 English](README_EN.md) | [🇨🇳 简体中文](README.md)
 
-**Telegram Private Chatbot** is a high-performance, two-way private messaging bot based on **Cloudflare Workers**. It is designed to solve the problem of spam harassment on Telegram, featuring a zero-latency local CAPTCHA verification system, a powerful set of administrator commands, and a seamless message forwarding experience.
+**Telegram Private Chatbot** is a high-performance, two-way private messaging bot based on **Cloudflare Workers**. It is designed to solve the problem of spam harassment on Telegram, featuring Cloudflare Turnstile human verification and smart content filtering, a powerful set of administrator commands, and a seamless message forwarding experience.
 
 Deploy a free, enterprise-grade customer service system utilizing Cloudflare's powerful edge computing network without purchasing any servers.
 
@@ -32,11 +32,12 @@ Version 4.0 removes all unstable external API dependencies, focusing on **extrem
 
 | Feature | Description |
 | :--- | :--- |
-| **⚡ Zero-Latency Verification** | Uses a **local curated trivia database**. Verifies instantly, completely eliminating network timeouts and API errors with a 100% success rate. |
-| **🛡️ Smart Anti-Spam** | **Short ID mechanism** fixes the Telegram button click failure bug. Provides a **30-day disturbance-free period** after verification, balancing security and user experience. |
+| **⚡ Human Verification** | Supports **Cloudflare Turnstile** enterprise-grade human verification (embedded webpage, ~5 seconds). Falls back to a local trivia quiz when Turnstile is not configured — 100% success rate. |
+| **🧠 Smart Content Filtering** | Pure local rule scoring (keywords / regex / link entities). Automatically blocks ads, lead-gen, scams and porn; warns the user, does not forward, and auto-bans after 3 strikes. |
+| **🛡️ Smart Anti-Spam** | **Short ID mechanism** fixes the Telegram button click failure bug. One-time verification grants **permanent disturbance-free** access; problematic users are handled by the admin via `/ban`. |
 | **💬 Topic Group Management** | Utilizes **Telegram Forum Topics** to automatically create a separate topic for each private chat user, isolating messages for organized management. |
 | **👮 Invisible Command System** | Automatically **intercepts** commands starting with `/` sent by users to prevent harassment. Admin commands are only effective within the administrator group. |
-| **🔒 Permission Control** | Powerful command set: Supports **Ban (/ban)**, **Unban (/unban)**, **Close Ticket (/close)**, and **Trust (/trust)** operations. |
+| **🔒 Permission Control** | Powerful command set: **Ban (/ban)**, **Unban (/unban)**, **Close (/close)**, **Trust (/trust)**, **Info (/info)**, **Cleanup (/cleanup)** and more. |
 | **☁️ Serverless** | Runs entirely on Cloudflare Workers. **Zero cost**, server-free, maintenance-free, and handles high concurrency. |
 | **📸 Multimedia Support** | Perfectly supports two-way forwarding of text, images, videos, files, and other message formats without losing any details. |
 
@@ -48,13 +49,58 @@ Version 4.0 removes all unstable external API dependencies, focusing on **extrem
 
 | Command | Action | Scenario |
 | :--- | :--- | :--- |
+| `/help` | **Command Help**<br>Lists all admin commands and their purpose. | Whenever you forget a command. |
 | `/close` | **Force Close Chat**<br>The bot will notify the user that the chat has ended and reject new messages. | Ticket resolved; politely ending the consultation. |
 | `/open` | **Reopen Chat**<br>Resumes message forwarding for the user. | Accidental closure, or the user needs to contact again. |
 | `/ban` | **Ban User**<br>The bot will completely ignore all messages from this user (no notification). | Malicious spamming, ad bots. |
 | `/unban` | **Unban User**<br>Restores the user's normal communication permissions. | Giving a second chance. |
-| `/trust` | **Permanent Trust**<br>The user will be permanently exempt from CAPTCHA verification (never expires). | Acquaintances, VIP clients, long-term partners. |
+| `/trust` | **Permanent Trust**<br>The user will be permanently exempt from human verification (never expires). | Acquaintances, VIP clients, long-term partners. |
 | `/reset` | **Reset Verification**<br>Forcibly clears the user's verification status; re-verification required next time. | Testing verification flow, or suspected account compromise. |
 | `/info` | **View Info**<br>Displays the current user's UID, Topic ID, and profile link. | Checking user details. |
+| `/cleanup` | **Batch Cleanup**<br>Scans and cleans up data for users whose topics have been deleted. | Clearing stale users. |
+
+---
+
+## 🔐 Advanced: Turnstile Verification + Smart Content Filtering (v5.4)
+
+v5.4 upgrades the local trivia quiz to **Cloudflare Turnstile** and adds **smart content filtering**. New workflow:
+
+```
+Stranger DMs → Turnstile human verification (embedded page) → content analysis (local rule scoring)
+    → Normal message: forwarded to the admin topic
+    → Ad/abusive content: warn user + not forwarded + strike recorded (auto-ban after 3 strikes)
+```
+
+### Enable Turnstile (Optional)
+
+1. Log in to the [Cloudflare Dashboard](https://dash.cloudflare.com/) → **Turnstile** → **Add site**.
+2. Fill in your Worker domain (e.g. `xxx.workers.dev`; also add any custom domain).
+3. Copy the **Site Key** and **Secret Key**, then add them under Worker **Settings → Variables**:
+    * `TURNSTILE_SITEKEY`: Site Key (plain variable)
+    * `TURNSTILE_SECRET`: Secret Key (**recommended: store as Secret**)
+4. If using a custom domain, also add `PUBLIC_BASE_URL` (e.g. `https://chat.example.com`); otherwise skip it.
+
+> If these two variables are not set, the bot automatically falls back to the local trivia quiz — existing features remain unaffected.
+
+### Smart Content Filtering (enabled by default, pure local rules)
+
+Before forwarding, every message is scored by local rules (keywords + regex + link entities) and then triaged:
+
+* **Block**: score reaches the threshold (default 60) — ads, lead-gen, scams and porn are blocked: the user is warned (with the reason), the message is not forwarded, and a strike is recorded. After 3 strikes the user is auto-banned (adjust `CONFIG.FILTER_STRIKE_LIMIT` at the top of `worker.js`).
+* **Flag**: score is in the gray zone (default 20~59) — the message is forwarded, but the admin is first notified in the topic with the suspicious signals to review.
+* **Pass**: score below threshold — forwarded normally.
+
+Rules live in `worker.js`: `SPAM_RULE_GROUPS` (keyword weights) and `SPAM_PATTERNS` (regex features); thresholds are `FILTER_BLOCK_SCORE` / `FILTER_GRAY_SCORE` in the top `CONFIG`.
+
+### Optional: Webhook Secret
+
+Set the environment variable `WEBHOOK_SECRET` (any random string) and change the webhook activation URL to:
+
+```
+https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=<YOUR_WORKER_URL>&secret_token=<WEBHOOK_SECRET>
+```
+
+All requests without the correct secret token will be rejected (HTTP 403).
 
 ---
 
@@ -131,19 +177,21 @@ A: Please check if the Webhook is set correctly. You must ensure Telegram is all
 **Q: Why can't the bot create topics in the group?**
 A: Please ensure: 1. Group ID is correct (starts with -100); 2. Topics are enabled in the group; 3. The bot is an administrator and has "Manage Topics" permission.
 
+**Q: Why can I pass verification but not receive forwarded messages?**
+A: Carefully check all variable names and IDs, then delete the webhook and reactivate it:
+ `(https://api.telegram.org/bot)<YOUR_TOKEN>/deleteWebhook?drop_pending_updates=true`
+
+If messages still can't be forwarded, try completing all steps and add the bot's admin permission last.
+
+**Q: Why does webhook setup fail?**
+A: If your custom domain doesn't work, switch the webhook back to the `workers.dev` domain and retry. This is usually caused by domain resolution failure or network restrictions.
+
 ---
 
 ## 🔒 Security Note
 
 > [!IMPORTANT]
-> Please keep your Bot API Token and Secret Token safe, as this information is critical to the security of your service.
-
-> [!WARNING]
-> Do not change the configured Secret Token arbitrarily! After changing it, all registered bots will fail to work because they cannot match the original token. If you need to change it, all bots must be re-registered.
-
-- Choose a secure and memorable Secret Token during initial setup.
-- Avoid using simple or common prefixes.
-- Do not share sensitive information with others.
+> Please keep your Bot API Token (and Webhook Secret, if set) safe and never leak them — they are critical to the security of your service.
 
 ---
 
