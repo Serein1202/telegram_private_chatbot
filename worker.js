@@ -381,6 +381,22 @@ async function checkRateLimit(userId, env, action = 'message', limit = 20, windo
 
 export default {
   async fetch(request, env, ctx) {
+    // ---- 临时诊断接口：报告当前部署实际可见的配置（仅布尔值，不泄露任何密钥）----
+    // 排查环境变量问题用，问题解决后可整段删除
+    {
+        const dbgUrl = new URL(request.url);
+        if (dbgUrl.pathname === "/debug/env") {
+            return new Response(JSON.stringify({
+                kv_bound: !!env.TOPIC_MAP,
+                bot_token_set: !!env.BOT_TOKEN,
+                supergroup_id_set: !!env.SUPERGROUP_ID,
+                workers_ai_bound: !!env.AI,
+                turnstile_sitekey_set: !!env.TURNSTILE_SITEKEY,
+                turnstile_secret_set: !!env.TURNSTILE_SECRET
+            }, null, 2), { headers: { "content-type": "application/json" } });
+        }
+    }
+
     // 环境自检
     if (!env.TOPIC_MAP) return new Response("Error: KV 'TOPIC_MAP' not bound.");
     if (!env.BOT_TOKEN) return new Response("Error: BOT_TOKEN not set.");
