@@ -1369,9 +1369,10 @@ async function handleTurnstileComplete(request, env, ctx) {
     // 身份校验：携带 initData 时校验 HMAC 签名，防止代验/伪造
     const initData = String(body.initData || "");
     if (initData) {
-        if (!(await validateTelegramInitData(env, initData, userId))) {
-            Logger.warn('turnstile_initdata_invalid', { userId });
-            return jsonResp({ ok: false, message: "身份校验失败，请从 Telegram 内打开验证" }, 403);
+        const v = await validateTelegramInitData(env, initData, userId);
+        if (!v.ok) {
+            Logger.warn('turnstile_initdata_invalid', { userId, reason: v.reason, detail: v.detail || null });
+            return jsonResp({ ok: false, message: `身份校验失败（${v.reason}${v.detail ? "；" + v.detail : ""}），请返回聊天窗口重新发送消息` }, 403);
         }
     } else {
         Logger.warn('turnstile_initdata_missing', { userId });
@@ -1459,19 +1460,22 @@ async function handleTurnstileComplete(request, env, ctx) {
  * 校验 Telegram WebApp initData 的 HMAC 签名（官方算法）：
  * secret_key = HMAC_SHA256(bot_token, "WebAppData")
  * hash       = HMAC_SHA256(secret_key, data_check_string)
+ * 返回 { ok, reason, detail }，reason 标识具体失败环节（用于诊断）
  */
 async function validateTelegramInitData(env, initData, expectedUserId) {
     try {
         const params = new URLSearchParams(initData);
         const hash = params.get("hash");
         const authDate = parseInt(params.get("auth_date") || "0", 10);
-        if (!hash || !authDate) return false;
-        if (Math.floor(Date.now() / 1000) - authDate > CONFIG.TURNSTILE_INITDATA_MAX_AGE) return false;
+        if (!hash) return { ok: false, reason: "no_hash" };
+        if (!authDate) return { ok: false, reason: "no_auth_date" };
+        const age = Math.floor(Date.now() / 1000) - authDate;
+        if (age > CONFIG.TURNSTILE_INITDATA_MAX_AGE) return { ok: false, reason: "expired", detail: `auth_age=${age}s` };
 
         const userRaw = params.get("user");
         if (userRaw) {
             const u = JSON.parse(userRaw);
-            if (Number(u.id) !== Number(expectedUserId)) return false;
+            if (Number(u.id) !== Number(expectedUserId)) return { ok: false, reason: "user_mismatch", detail: `initData_uid=${u.id} expected=${expectedUserId}` };
         }
 
         const dataCheckString = [...params.entries()]
@@ -1492,10 +1496,13 @@ async function validateTelegramInitData(env, initData, expectedUserId) {
         );
         const calcBuf = await crypto.subtle.sign("HMAC", secretKey, enc.encode(dataCheckString));
         const calc = [...new Uint8Array(calcBuf)].map(b => b.toString(16).padStart(2, "0")).join("");
-        return calc === hash;
+        if (calc !== hash) {
+            return { ok: false, reason: "hmac_mismatch", detail: `fields=${[...params.keys()].sort().join(",")}` };
+        }
+        return { ok: true };
     } catch (e) {
         Logger.error('initdata_validate_failed', e);
-        return false;
+        return { ok: false, reason: "exception", detail: String(e && e.message) };
     }
 }
 
