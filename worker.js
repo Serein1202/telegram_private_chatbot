@@ -1424,44 +1424,48 @@ async function handleTurnstileComplete(request, env, ctx) {
 
     Logger.info('turnstile_verification_passed', { userId });
 
-    await tgCall(env, "sendMessage", {
-        chat_id: userId,
-        text: "✅ **验证成功**\n\n您现在可以自由对话了。",
-        parse_mode: "Markdown"
-    });
-
-    // 补发验证期间暂存的消息
-    let pendingIds = Array.isArray(state.pending_ids) ? state.pending_ids.slice() : [];
-    if (pendingIds.length > CONFIG.PENDING_MAX_MESSAGES) {
-        pendingIds = pendingIds.slice(pendingIds.length - CONFIG.PENDING_MAX_MESSAGES);
-    }
-    if (pendingIds.length > 0) {
+    // 尽快把「成功」返回给前端，避免绿勾后还长时间卡在「正在校验」。
+    // 验证成功通知与暂存消息补发（含创建话题、健康探测等耗时操作）放到后台异步执行。
+    ctx.waitUntil((async () => {
         try {
-            let forwardedCount = 0;
-            for (const pendingId of pendingIds) {
-                if (!pendingId) continue;
-                const forwardedKey = `forwarded:${userId}:${pendingId}`;
-                if (await env.TOPIC_MAP.get(forwardedKey)) {
-                    Logger.info('message_forward_duplicate_skipped', { userId, messageId: pendingId });
-                    continue;
-                }
-                const fakeMsg = {
-                    message_id: pendingId,
-                    chat: { id: userId, type: "private" },
-                    from: { id: userId },
-                    text: (state.pending_texts && state.pending_texts[String(pendingId)]) || ""
-                };
-                const fwdResult = await forwardToTopic(fakeMsg, userId, `user:${userId}`, env, ctx);
-                await env.TOPIC_MAP.put(forwardedKey, "1", { expirationTtl: 3600 });
-                if (fwdResult === "pass" || fwdResult === "flag") {
-                    forwardedCount++;
-                }
+            await tgCall(env, "sendMessage", {
+                chat_id: userId,
+                text: "✅ **验证成功**\n\n您现在可以自由对话了。",
+                parse_mode: "Markdown"
+            });
+
+            // 补发验证期间暂存的消息
+            let pendingIds = Array.isArray(state.pending_ids) ? state.pending_ids.slice() : [];
+            if (pendingIds.length > CONFIG.PENDING_MAX_MESSAGES) {
+                pendingIds = pendingIds.slice(pendingIds.length - CONFIG.PENDING_MAX_MESSAGES);
             }
-            if (forwardedCount > 0) {
-                await tgCall(env, "sendMessage", {
-                    chat_id: userId,
-                    text: `📩 刚才的 ${forwardedCount} 条消息已帮您送达。`
-                });
+            if (pendingIds.length > 0) {
+                let forwardedCount = 0;
+                for (const pendingId of pendingIds) {
+                    if (!pendingId) continue;
+                    const forwardedKey = `forwarded:${userId}:${pendingId}`;
+                    if (await env.TOPIC_MAP.get(forwardedKey)) {
+                        Logger.info('message_forward_duplicate_skipped', { userId, messageId: pendingId });
+                        continue;
+                    }
+                    const fakeMsg = {
+                        message_id: pendingId,
+                        chat: { id: userId, type: "private" },
+                        from: { id: userId },
+                        text: (state.pending_texts && state.pending_texts[String(pendingId)]) || ""
+                    };
+                    const fwdResult = await forwardToTopic(fakeMsg, userId, `user:${userId}`, env, ctx);
+                    await env.TOPIC_MAP.put(forwardedKey, "1", { expirationTtl: 3600 });
+                    if (fwdResult === "pass" || fwdResult === "flag") {
+                        forwardedCount++;
+                    }
+                }
+                if (forwardedCount > 0) {
+                    await tgCall(env, "sendMessage", {
+                        chat_id: userId,
+                        text: `📩 刚才的 ${forwardedCount} 条消息已帮您送达。`
+                    });
+                }
             }
         } catch (e) {
             Logger.error('pending_message_forward_failed', e, { userId });
@@ -1470,7 +1474,7 @@ async function handleTurnstileComplete(request, env, ctx) {
                 text: "⚠️ 自动发送失败，请重新发送您的消息。"
             });
         }
-    }
+    })());
 
     return jsonResp({ ok: true });
 }
