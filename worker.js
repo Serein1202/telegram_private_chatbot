@@ -1,4 +1,4 @@
-// Cloudflare Worker：Telegram 双向机器人 v5.3
+// Cloudflare Worker：Telegram 双向机器人 v5.4（Turnstile 人机验证 + 智能内容过滤）
 
 // --- 配置常量 ---
 const CONFIG = {
@@ -21,7 +21,16 @@ const CONFIG = {
     MAX_CLEANUP_DISPLAY: 20,
     CLEANUP_LOCK_TTL_SECONDS: 1800,     // /cleanup 防并发锁 30 分钟
     MAX_RETRY_ATTEMPTS: 3,
-    THREAD_HEALTH_TTL_MS: 60000
+    THREAD_HEALTH_TTL_MS: 60000,
+    // ---- Turnstile 人机验证 ----
+    TURNSTILE_LINK_TTL_SECONDS: 300,     // 验证链接有效期 5 分钟
+    TURNSTILE_INITDATA_MAX_AGE: 3600,    // initData 签名最大时效 1 小时
+    // ---- 智能内容过滤 ----
+    FILTER_BLOCK_SCORE: 60,             // 规则评分达到该值直接拦截
+    FILTER_GRAY_SCORE: 20,               // 达到该值进入灰区，交给 AI 仲裁
+    FILTER_STRIKE_LIMIT: 3,              // 累计违规达到该次数自动封禁
+    FILTER_STRIKE_TTL_SECONDS: 604800,   // 违规计数窗口 7 天
+    AI_MODEL: "@cf/meta/llama-3.1-8b-instruct"
 };
 
 // 线程健康检查缓存，减少频繁探测请求
@@ -377,11 +386,32 @@ export default {
     if (!env.BOT_TOKEN) return new Response("Error: BOT_TOKEN not set.");
     if (!env.SUPERGROUP_ID) return new Response("Error: SUPERGROUP_ID not set.");
 
+    const url = new URL(request.url);
+
+    // ---- Turnstile 验证页面与回调接口 ----
+    if (request.method === "GET" && url.pathname === "/verify") {
+        return handleTurnstilePage(request, env);
+    }
+    if (request.method === "POST" && url.pathname === "/turnstile/complete") {
+        return handleTurnstileComplete(request, env, ctx);
+    }
+
+    // ---- Webhook 加密校验（可选加固）----
+    // 设置 WEBHOOK_SECRET 后，未携带正确请求头的伪造请求将被直接拒绝
+    if (env.WEBHOOK_SECRET) {
+        const secretHeader = request.headers.get("x-telegram-bot-api-secret-token");
+        if (secretHeader !== String(env.WEBHOOK_SECRET)) {
+            Logger.warn('webhook_secret_rejected', { path: url.pathname });
+            return new Response("Forbidden", { status: 403 });
+        }
+    }
+
     // 【修复 #7】规范化环境变量，统一为字符串类型
     const normalizedEnv = {
         ...env,
         SUPERGROUP_ID: String(env.SUPERGROUP_ID),
-        BOT_TOKEN: String(env.BOT_TOKEN)
+        BOT_TOKEN: String(env.BOT_TOKEN),
+        SELF_ORIGIN: env.PUBLIC_BASE_URL || url.origin   // 生成验证页链接用
     };
 
     // 验证 SUPERGROUP_ID 格式
@@ -586,6 +616,51 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
                 await env.TOPIC_MAP.put(kvHealthKey, "1", { expirationTtl: Math.ceil(CONFIG.THREAD_HEALTH_TTL_MS / 1000) });
             }
             }
+        }
+    }
+
+    // ---- 智能内容过滤：识别广告/引流/不良内容，拦截并警告 ----
+    const filterResult = await filterMessage(msg, env);
+    if (filterResult.action === "block") {
+        const strikeKey = `strikes:${userId}`;
+        const strikes = parseInt(await env.TOPIC_MAP.get(strikeKey) || "0") + 1;
+        if (strikes >= CONFIG.FILTER_STRIKE_LIMIT) {
+            await env.TOPIC_MAP.put(`banned:${userId}`, "1");
+        } else {
+            await env.TOPIC_MAP.put(strikeKey, String(strikes), { expirationTtl: CONFIG.FILTER_STRIKE_TTL_SECONDS });
+        }
+
+        const reasonText = filterResult.reasons.slice(0, 3).join("、");
+        await tgCall(env, "sendMessage", {
+            chat_id: userId,
+            text: strikes >= CONFIG.FILTER_STRIKE_LIMIT
+                ? "🚫 检测到您多次发送广告或违规内容，已被拉黑。"
+                : `⚠️ 您的消息疑似包含广告或不良内容（${reasonText}），已被拦截，未送达对方。\n累计 ${CONFIG.FILTER_STRIKE_LIMIT} 次将被拉黑（当前 ${strikes}/${CONFIG.FILTER_STRIKE_LIMIT}）。`
+        });
+
+        // 通知管理员（仅通知原因，不转发原始内容）
+        try {
+            await tgCall(env, "sendMessage", withMessageThreadId({
+                chat_id: env.SUPERGROUP_ID,
+                text: `⛔ **已拦截违规消息**\n用户: [${userId}](tg://user?id=${userId})\n原因: ${reasonText}\n警告: ${strikes}/${CONFIG.FILTER_STRIKE_LIMIT}${strikes >= CONFIG.FILTER_STRIKE_LIMIT ? "（已自动封禁）" : ""}`,
+                parse_mode: "Markdown"
+            }, rec.thread_id));
+        } catch (e) {
+            // 通知失败不影响主流程
+        }
+        Logger.info('content_blocked', { userId, reasons: filterResult.reasons, strikes });
+        return;
+    }
+    if (filterResult.action === "flag") {
+        // 灰区消息：无法 AI 仲裁时照常转发，但提前向管理员提示可疑特征
+        try {
+            await tgCall(env, "sendMessage", withMessageThreadId({
+                chat_id: env.SUPERGROUP_ID,
+                text: `⚠️ **可疑消息提醒**\n用户: [${userId}](tg://user?id=${userId})\n特征: ${filterResult.reasons.slice(0, 3).join("、")}\n（AI 仲裁不可用，请自行甄别下方消息）`,
+                parse_mode: "Markdown"
+            }, rec.thread_id));
+        } catch (e) {
+            // 提示失败不影响转发
         }
     }
 
@@ -810,6 +885,13 @@ async function handleAdminReply(msg, env, ctx) {
 // ---------------- 验证模块 (纯本地) ----------------
 
 async function sendVerificationChallenge(userId, env, pendingMsgId) {
+    // 优先使用 Cloudflare Turnstile 验证（配置 TURNSTILE_SITEKEY + TURNSTILE_SECRET 后生效）
+    if (isTurnstileEnabled(env)) {
+        await sendTurnstileChallenge(userId, env, pendingMsgId);
+        return;
+    }
+
+    // 兜底方案：未配置 Turnstile 时沿用本地题库验证（原逻辑不变）
     // 【修复 #1】检查是否已有进行中的验证
     const existingChallenge = await env.TOPIC_MAP.get(`user_challenge:${userId}`);
     if (existingChallenge) {
@@ -1062,6 +1144,462 @@ async function handleCallbackQuery(query, env, ctx) {
             show_alert: true
         });
     }
+}
+
+// ---------------- Turnstile 人机验证模块 ----------------
+
+function isTurnstileEnabled(env) {
+    return !!(env.TURNSTILE_SITEKEY && env.TURNSTILE_SECRET);
+}
+
+/**
+ * 下发 Turnstile 验证：向用户私聊发送 web_app 按钮，
+ * 打开 Worker 自托管的验证页完成 Cloudflare Turnstile 挑战。
+ * 验证期间的消息 ID 暂存在 KV，验证通过后自动补发。
+ */
+async function sendTurnstileChallenge(userId, env, pendingMsgId) {
+    // 进行中的验证只追加待发消息，不重复下发按钮（防止刷接口）
+    const existingToken = await env.TOPIC_MAP.get(`user_challenge:${userId}`);
+    if (existingToken) {
+        const stateKey = `ts:${existingToken}`;
+        const state = await safeGetJSON(env, stateKey, null);
+        if (state && state.userId === userId) {
+            if (pendingMsgId) {
+                let pendingIds = Array.isArray(state.pending_ids) ? state.pending_ids.slice() : [];
+                if (!pendingIds.includes(pendingMsgId)) {
+                    pendingIds.push(pendingMsgId);
+                    if (pendingIds.length > CONFIG.PENDING_MAX_MESSAGES) {
+                        pendingIds = pendingIds.length - CONFIG.PENDING_MAX_MESSAGES > 0
+                            ? pendingIds.slice(pendingIds.length - CONFIG.PENDING_MAX_MESSAGES)
+                            : pendingIds;
+                    }
+                    state.pending_ids = pendingIds;
+                    await env.TOPIC_MAP.put(stateKey, JSON.stringify(state), { expirationTtl: CONFIG.TURNSTILE_LINK_TTL_SECONDS });
+                }
+            }
+            Logger.debug('turnstile_duplicate_skipped', { userId, hasPending: !!pendingMsgId });
+            return;
+        }
+        // KV 不一致：自愈清理后重新下发
+        await env.TOPIC_MAP.delete(`user_challenge:${userId}`);
+    }
+
+    const verifyLimit = await checkRateLimit(userId, env, 'verify', CONFIG.RATE_LIMIT_VERIFY, 300);
+    if (!verifyLimit.allowed) {
+        await tgCall(env, "sendMessage", {
+            chat_id: userId,
+            text: "⚠️ 验证请求过于频繁，请5分钟后再试。"
+        });
+        return;
+    }
+
+    // 生成一次性验证链接令牌（32 位加密随机串，5 分钟有效）
+    const linkToken = secureRandomId(32);
+    const state = { userId, pending_ids: pendingMsgId ? [pendingMsgId] : [] };
+    await env.TOPIC_MAP.put(`ts:${linkToken}`, JSON.stringify(state), { expirationTtl: CONFIG.TURNSTILE_LINK_TTL_SECONDS });
+    await env.TOPIC_MAP.put(`user_challenge:${userId}`, linkToken, { expirationTtl: CONFIG.TURNSTILE_LINK_TTL_SECONDS });
+
+    Logger.info('turnstile_challenge_sent', {
+        userId,
+        pendingCount: state.pending_ids.length
+    });
+
+    const origin = env.PUBLIC_BASE_URL || env.SELF_ORIGIN;
+    if (!origin) {
+        Logger.error('turnstile_origin_missing', new Error("无法确定 Worker 公网地址，请配置 PUBLIC_BASE_URL"));
+        return;
+    }
+    const verifyUrl = `${origin}/verify?t=${linkToken}`;
+
+    await tgCall(env, "sendMessage", {
+        chat_id: userId,
+        text: "🛡️ **人机验证**\n\n请点击下方按钮完成 Cloudflare 人机验证（约 5 秒）。\n验证通过后，您刚才的消息将自动送达。",
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: [[{ text: "✅ 点击进行人机验证", web_app: { url: verifyUrl } }]] }
+    });
+}
+
+/**
+ * 渲染 Turnstile 验证页（由 Worker 直接托管）。
+ * 页面在 Telegram 内置浏览器中打开，可读取 initData 用于身份绑定。
+ */
+function buildTurnstilePage(env, expired) {
+    const sitekey = String(env.TURNSTILE_SITEKEY).replace(/[^a-zA-Z0-9_-]/g, "");
+
+    const body = expired
+        ? '<div class="card"><h2>⏳ 链接已过期</h2><p>验证链接已失效，请回到 Telegram 聊天窗口重新发送一条消息，即可获取新的验证。</p></div>'
+        : [
+              '<div class="card">',
+              '  <h2>🛡️ 人机验证</h2>',
+              '  <p>为了防止广告与骚扰，请先完成下方验证。验证通过后将自动返回聊天窗口。</p>',
+              '  <div id="widget"></div>',
+              '  <p id="status"></p>',
+              '</div>',
+              '<script>',
+              '  var tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;',
+              '  if (tg && tg.ready) { tg.ready(); }',
+              '  if (tg && tg.expand) { tg.expand(); }',
+              '  function setStatus(text, cls) {',
+              '    var s = document.getElementById("status");',
+              '    if (s) { s.textContent = text; s.className = cls || ""; }',
+              '  }',
+              '  function initWidget() {',
+              '    try {',
+              '      turnstile.render("#widget", {',
+              '        sitekey: "' + sitekey + '",',
+              '        theme: "auto",',
+              '        language: "zh-cn",',
+              '        callback: function (token) { submitVerify(token); }',
+              '      });',
+              '    } catch (e) {',
+              '      setStatus("验证组件加载失败，请刷新重试", "err");',
+              '    }',
+              '  }',
+              '  function submitVerify(token) {',
+              '    setStatus("正在校验，请稍候…", "");',
+              '    var payload = {',
+              '      t: new URLSearchParams(location.search).get("t"),',
+              '      cf: token,',
+              '      initData: (tg && tg.initData) ? tg.initData : ""',
+              '    };',
+              '    fetch("/turnstile/complete", {',
+              '      method: "POST",',
+              '      headers: { "content-type": "application/json" },',
+              '      body: JSON.stringify(payload)',
+              '    }).then(function (r) { return r.json(); }).then(function (res) {',
+              '      if (res.ok) {',
+              '        setStatus("✅ 验证成功！正在返回 Telegram…", "ok");',
+              '        setTimeout(function () { if (tg && tg.close) { tg.close(); } }, 1600);',
+              '      } else {',
+              '        setStatus("❌ " + (res.message || "验证失败，请返回聊天窗口重新发送消息"), "err");',
+              '      }',
+              '    }).catch(function () {',
+              '      setStatus("网络错误，请重试", "err");',
+              '    });',
+              '  }',
+              '</script>',
+              '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=initWidget&render=explicit" async defer></script>'
+          ].join("\n");
+
+    return `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>人机验证</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f5f6f8; color: #1c1e21; display: flex; min-height: 100vh; align-items: center; justify-content: center; }
+  .card { background: #fff; border-radius: 16px; box-shadow: 0 2px 12px rgba(0,0,0,.08); padding: 28px 24px; max-width: 360px; width: calc(100% - 48px); text-align: center; }
+  h2 { font-size: 18px; margin: 0 0 10px; }
+  p { font-size: 14px; line-height: 1.6; color: #555; }
+  #widget { display: flex; justify-content: center; margin: 18px 0; min-height: 65px; }
+  #status { min-height: 20px; font-size: 14px; }
+  #status.ok { color: #0f6e56; font-weight: 600; }
+  #status.err { color: #b02a2a; }
+</style>
+</head>
+<body>
+${body}
+</body>
+</html>`;
+}
+
+async function handleTurnstilePage(request, env) {
+    if (!isTurnstileEnabled(env)) {
+        return new Response("Turnstile 未配置：请设置 TURNSTILE_SITEKEY 与 TURNSTILE_SECRET 环境变量。", { status: 404 });
+    }
+    const token = (new URL(request.url).searchParams.get("t") || "").replace(/[^a-zA-Z0-9]/g, "");
+    const state = token ? await safeGetJSON(env, `ts:${token}`, null) : null;
+    const expired = !state || state.userId === undefined;
+    return new Response(buildTurnstilePage(env, expired), {
+        headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }
+    });
+}
+
+/**
+ * Turnstile 完成回调：
+ * 1. 校验一次性链接令牌（KV 中存在且未过期）
+ * 2. 校验 Telegram initData HMAC 签名，确保是本人操作
+ * 3. 调用 Cloudflare siteverify 校验挑战结果
+ * 4. 标记 30 天免验证，补发暂存消息
+ */
+async function handleTurnstileComplete(request, env, ctx) {
+    const jsonResp = (obj, status) => new Response(JSON.stringify(obj), {
+        status: status || 200,
+        headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }
+    });
+
+    if (!isTurnstileEnabled(env)) return jsonResp({ ok: false, message: "Turnstile 未配置" }, 404);
+
+    let body;
+    try {
+        body = await request.json();
+    } catch (e) {
+        return jsonResp({ ok: false, message: "请求格式错误" }, 400);
+    }
+
+    const linkToken = String(body.t || "").replace(/[^a-zA-Z0-9]/g, "");
+    const cfResponse = String(body.cf || "");
+    if (!linkToken || !cfResponse) return jsonResp({ ok: false, message: "参数缺失" }, 400);
+
+    const stateKey = `ts:${linkToken}`;
+    const state = await safeGetJSON(env, stateKey, null);
+    if (!state || state.userId === undefined) {
+        return jsonResp({ ok: false, message: "验证链接已过期，请返回聊天窗口重新发送消息" }, 410);
+    }
+    const userId = state.userId;
+
+    // 身份校验：携带 initData 时校验 HMAC 签名，防止代验/伪造
+    const initData = String(body.initData || "");
+    if (initData) {
+        if (!(await validateTelegramInitData(env, initData, userId))) {
+            Logger.warn('turnstile_initdata_invalid', { userId });
+            return jsonResp({ ok: false, message: "身份校验失败，请从 Telegram 内打开验证" }, 403);
+        }
+    } else {
+        Logger.warn('turnstile_initdata_missing', { userId });
+    }
+
+    // 调用 Cloudflare siteverify
+    const form = new FormData();
+    form.append("secret", String(env.TURNSTILE_SECRET));
+    form.append("response", cfResponse);
+    let svResult;
+    try {
+        const svResp = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+            method: "POST",
+            body: form
+        });
+        svResult = await svResp.json();
+    } catch (e) {
+        Logger.error('turnstile_siteverify_failed', e, { userId });
+        return jsonResp({ ok: false, message: "验证服务暂时不可用，请稍后重试" }, 502);
+    }
+    if (!svResult || !svResult.success) {
+        Logger.warn('turnstile_verify_failed', { userId, errors: svResult && svResult["error-codes"] });
+        return jsonResp({ ok: false, message: "人机验证未通过，请重新验证" }, 400);
+    }
+
+    // 幂等：立即删除一次性链接与进行中标记
+    await env.TOPIC_MAP.delete(stateKey);
+    await env.TOPIC_MAP.delete(`user_challenge:${userId}`);
+
+    // 30 天免验证
+    await env.TOPIC_MAP.put(`verified:${userId}`, "1", { expirationTtl: CONFIG.VERIFIED_EXPIRE_SECONDS });
+    await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
+
+    Logger.info('turnstile_verification_passed', { userId });
+
+    await tgCall(env, "sendMessage", {
+        chat_id: userId,
+        text: "✅ **验证成功**\n\n您现在可以自由对话了。",
+        parse_mode: "Markdown"
+    });
+
+    // 补发验证期间暂存的消息
+    let pendingIds = Array.isArray(state.pending_ids) ? state.pending_ids.slice() : [];
+    if (pendingIds.length > CONFIG.PENDING_MAX_MESSAGES) {
+        pendingIds = pendingIds.slice(pendingIds.length - CONFIG.PENDING_MAX_MESSAGES);
+    }
+    if (pendingIds.length > 0) {
+        try {
+            let forwardedCount = 0;
+            for (const pendingId of pendingIds) {
+                if (!pendingId) continue;
+                const forwardedKey = `forwarded:${userId}:${pendingId}`;
+                if (await env.TOPIC_MAP.get(forwardedKey)) {
+                    Logger.info('message_forward_duplicate_skipped', { userId, messageId: pendingId });
+                    continue;
+                }
+                const fakeMsg = {
+                    message_id: pendingId,
+                    chat: { id: userId, type: "private" },
+                    from: { id: userId }
+                };
+                await forwardToTopic(fakeMsg, userId, `user:${userId}`, env, ctx);
+                await env.TOPIC_MAP.put(forwardedKey, "1", { expirationTtl: 3600 });
+                forwardedCount++;
+            }
+            if (forwardedCount > 0) {
+                await tgCall(env, "sendMessage", {
+                    chat_id: userId,
+                    text: `📩 刚才的 ${forwardedCount} 条消息已帮您送达。`
+                });
+            }
+        } catch (e) {
+            Logger.error('pending_message_forward_failed', e, { userId });
+            await tgCall(env, "sendMessage", {
+                chat_id: userId,
+                text: "⚠️ 自动发送失败，请重新发送您的消息。"
+            });
+        }
+    }
+
+    return jsonResp({ ok: true });
+}
+
+/**
+ * 校验 Telegram WebApp initData 的 HMAC 签名（官方算法）：
+ * secret_key = HMAC_SHA256(bot_token, "WebAppData")
+ * hash       = HMAC_SHA256(secret_key, data_check_string)
+ */
+async function validateTelegramInitData(env, initData, expectedUserId) {
+    try {
+        const params = new URLSearchParams(initData);
+        const hash = params.get("hash");
+        const authDate = parseInt(params.get("auth_date") || "0", 10);
+        if (!hash || !authDate) return false;
+        if (Math.floor(Date.now() / 1000) - authDate > CONFIG.TURNSTILE_INITDATA_MAX_AGE) return false;
+
+        const userRaw = params.get("user");
+        if (userRaw) {
+            const u = JSON.parse(userRaw);
+            if (Number(u.id) !== Number(expectedUserId)) return false;
+        }
+
+        const dataCheckString = [...params.entries()]
+            .filter(([k]) => k !== "hash")
+            .map(([k, v]) => `${k}=${v}`)
+            .sort()
+            .join("\n");
+
+        const enc = new TextEncoder();
+        const botKey = await crypto.subtle.importKey(
+            "raw", enc.encode(String(env.BOT_TOKEN)),
+            { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+        );
+        const secretBuf = await crypto.subtle.sign("HMAC", botKey, enc.encode("WebAppData"));
+        const secretKey = await crypto.subtle.importKey(
+            "raw", secretBuf,
+            { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+        );
+        const calcBuf = await crypto.subtle.sign("HMAC", secretKey, enc.encode(dataCheckString));
+        const calc = [...new Uint8Array(calcBuf)].map(b => b.toString(16).padStart(2, "0")).join("");
+        return calc === hash;
+    } catch (e) {
+        Logger.error('initdata_validate_failed', e);
+        return false;
+    }
+}
+
+// ---------------- 智能内容过滤模块 ----------------
+
+// 关键词规则组（每组命中只计一次权重）
+const SPAM_RULE_GROUPS = [
+    { weight: 60, name: "违法/色情/赌博", keywords: ["博彩", "赌球", "六合彩", "时时彩", "开元棋牌", "开户存送", "色情", "援交", "裸聊", "约炮", "一夜情", "福利姬", "毒品", "冰毒", "洗钱", "枪支买卖"] },
+    { weight: 40, name: "兼职刷单/返利", keywords: ["刷单", "返利", "日入", "月入过万", "稳赚", "躺赚", "带你赚", "带单", "高额回报", "保本保息", "红包返现", "动动手指", "宝妈兼职", "闲鱼无货源"] },
+    { weight: 40, name: "联系方式引流", keywords: ["加微信", "加vx", "加v信", "加威信", "薇信", "私聊我", "联系我", "扫码进群", "进群领", "加q群", "扣扣"] },
+    { weight: 30, name: "广告推广", keywords: ["推广", "代刷", "代充", "高仿", "莆田", "一手货源", "招代理", "招商加盟", "外发加工", "接单", "低价代购"] },
+    { weight: 35, name: "虚拟币/投资诈骗", keywords: ["usdt", "u商", "收u", "出u", "泰达币", "虚拟币", "挖矿收益", "交易所返佣", "老师带单", "内幕消息"] }
+];
+
+// 正则特征规则（每条命中只计一次权重）
+const SPAM_PATTERNS = [
+    { weight: 45, name: "Telegram 引流链接", re: /(?:t\.me|telegram\.me)\/\S+/i },
+    { weight: 25, name: "外部链接", re: /(?:https?:\/\/|www\.)\S+/i },
+    { weight: 40, name: "社交联系方式", re: /(?:微信|vx|v信|威信|薇信|wx|扣扣|qq)\s*[:：号]?\s*[a-z0-9_-]{5,}/i },
+    { weight: 40, name: "手机号", re: /(?:^|\D)1[3-9]\d{9}(?!\d)/ },
+    { weight: 30, name: "字符刷屏", re: /(.)\1{6,}/ },
+    { weight: 25, name: "表情刷屏", re: /(?:[\u{1F300}-\u{1FAFF}]\s*){6,}/u }
+];
+
+/**
+ * 规则层：对消息做特征打分
+ */
+function analyzeContentSignals(msg) {
+    const text = ((msg && (msg.text || msg.caption)) || "").trim();
+    const result = { text, score: 0, reasons: [] };
+    if (!text) return result;
+    const lower = text.toLowerCase();
+
+    for (const group of SPAM_RULE_GROUPS) {
+        for (const kw of group.keywords) {
+            if (lower.includes(kw.toLowerCase())) {
+                result.score += group.weight;
+                result.reasons.push(`${group.name}「${kw}」`);
+                break;
+            }
+        }
+    }
+
+    for (const p of SPAM_PATTERNS) {
+        if (p.re.test(text)) {
+            result.score += p.weight;
+            result.reasons.push(p.name);
+        }
+    }
+
+    // 结构化信号：消息内嵌的 URL 实体
+    const entities = (msg && msg.entities) || [];
+    const urlCount = entities.filter(e => e.type === "url" || e.type === "text_link").length;
+    if (urlCount >= 3) {
+        result.score += 40;
+        result.reasons.push("多个链接实体");
+    } else if (urlCount === 1) {
+        result.score += 15;
+        result.reasons.push("含链接实体");
+    }
+
+    return result;
+}
+
+/**
+ * AI 层：Workers AI（llama）对灰区消息做语义仲裁。
+ * 未绑定 AI 或调用失败时返回 null，交由调用方降级处理。
+ */
+async function aiClassifySpam(env, text) {
+    if (!env.AI) return null;
+    try {
+        const result = await env.AI.run(CONFIG.AI_MODEL, {
+            messages: [
+                {
+                    role: "system",
+                    content: "你是消息安全审核助手。判断下面的 Telegram 私聊消息是否属于垃圾广告、引流推广、诈骗或色情骚扰内容。只输出 JSON，不要输出其他文字，格式：{\"spam\": true, \"reason\": \"简短原因\"} 或 {\"spam\": false, \"reason\": \"\"}"
+                },
+                { role: "user", content: text.slice(0, 500) }
+            ],
+            max_tokens: 120
+        });
+        const raw = ((result && result.response) || "").trim();
+        const match = raw.match(/\{[\s\S]*\}/);
+        if (!match) return null;
+        const parsed = JSON.parse(match[0]);
+        return { spam: !!parsed.spam, reason: parsed.reason || "" };
+    } catch (e) {
+        Logger.warn('ai_classify_failed', { message: e instanceof Error ? e.message : String(e) });
+        return null;
+    }
+}
+
+/**
+ * 统一过滤入口：
+ * - 评分 >= FILTER_BLOCK_SCORE  → block（拦截 + 警告 + 计次）
+ * - 评分 >= FILTER_GRAY_SCORE   → AI 仲裁：判垃圾则 block，判正常则 pass，AI 不可用则 flag（转发但提醒管理员）
+ * - 其他                        → pass
+ */
+async function filterMessage(msg, env) {
+    const signals = analyzeContentSignals(msg);
+
+    if (signals.score >= CONFIG.FILTER_BLOCK_SCORE) {
+        return {
+            action: "block",
+            reasons: signals.reasons.length ? signals.reasons : ["命中垃圾内容特征"]
+        };
+    }
+
+    if (signals.score >= CONFIG.FILTER_GRAY_SCORE && signals.text) {
+        const ai = await aiClassifySpam(env, signals.text);
+        if (ai) {
+            if (ai.spam) {
+                return { action: "block", reasons: [ai.reason || "AI 判定为广告/垃圾内容"] };
+            }
+            return { action: "pass", reasons: [] };
+        }
+        return { action: "flag", reasons: signals.reasons };
+    }
+
+    return { action: "pass", reasons: signals.reasons };
 }
 
 // ---------------- 辅助函数 ----------------

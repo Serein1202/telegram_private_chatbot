@@ -1,4 +1,4 @@
-# 🤖 Telegram Private Chatbot (v5.3) 
+# 🤖 Telegram Private Chatbot (v5.4) 
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/jikssha/telegram_private_chatbot)
 ![GitHub stars](https://img.shields.io/github/stars/jikssha/telegram_private_chatbot?style=social)
@@ -52,7 +52,8 @@ v4.0 版本移除了所有不稳定的外部 API 依赖，专注于**极致的�
 
 | 特性 | 描述 |
 | :--- | :--- |
-| **⚡ 0 延迟验证** | 采用**本地精选常识题库**。秒开秒验，彻底告别网络超时与接口报错，验证成功率 100%。 |
+| **⚡ 人机验证** | 支持 **Cloudflare Turnstile** 企业级人机验证（内嵌网页，约 5 秒完成），未配置时自动回退本地题库，验证成功率 100%。 |
+| **🧠 智能内容过滤** | 规则评分 + **Workers AI** 语义仲裁双层过滤，自动拦截广告/引流/诈骗/色情消息，警告用户且不转发，累计 3 次自动封禁。 |
 | **🛡️ 智能防骚扰** | **短 ID 机制**修复了 Telegram 按钮点击失效的 Bug。验证通过后提供 **30 天免打扰期**，兼顾安全与用户体验。 |
 | **💬 话题群组管理** | 利用 **Telegram Forum Topics** 功能，自动为每位私聊用户创建一个独立的话题，消息隔离，管理井井有条。 |
 | **👮 隐形指令系统** | 自动**拦截**用户端发送的 `/` 开头指令，防止普通用户骚扰管理员。管理指令仅在管理员群组内生效。 |
@@ -76,6 +77,46 @@ v4.0 版本移除了所有不稳定的外部 API 依赖，专注于**极致的�
 | `/reset` | **重置验证**<br>强制清除该用户的验证状态，下次需重新验证。 | 测试验证流程，或怀疑账号被盗。 |
 | `/info` | **查看信息**<br>显示当前用户的 UID、话题 ID 和链接。 | 查询用户资料。 |
 | `/cleanup` | **批量清理**<br>扫描并清理已删除话题的用户数据。 | 清理失效用户。 |
+
+---
+
+## 🔐 进阶：Turnstile 人机验证 + 智能内容过滤 (v5.4)
+
+v5.4 将本地常识题验证升级为 **Cloudflare Turnstile**，并新增了**智能内容过滤**。新工作流：
+
+```
+陌生人私信 → Turnstile 人机验证（内嵌网页）→ 内容识别（规则评分 + Workers AI 仲裁）
+    → 正常消息：照常转发到管理员话题
+    → 广告/不良内容：警告用户 + 不转发 + 计入违规（累计 3 次自动封禁）
+```
+
+### 开启 Turnstile 验证（可选）
+
+1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/) → **Turnstile** → **Add site**。
+2. Domain 填写你的 Worker 域名（如 `xxx.workers.dev`；绑定了自定义域名则一并填上）。
+3. 拿到 **Site Key** 和 **Secret Key**，在 Worker **Settings → Variables** 添加：
+    * `TURNSTILE_SITEKEY`: Site Key（普通变量）
+    * `TURNSTILE_SECRET`: Secret Key（**建议设为 Secret 加密存储**）
+4. 如果绑定了自定义域名，另加 `PUBLIC_BASE_URL`（如 `https://chat.example.com`），否则无需配置。
+
+> 不配置这两个变量时，自动回退到本地题库验证，原有功能不受影响。
+
+### 智能内容过滤（默认已启用）
+
+* **规则层（默认启用）**：关键词黑名单（赌博/色情/刷单/引流/虚拟币诈骗等）+ 特征识别（t.me 引流链接、微信号/QQ/手机号、字符与表情刷屏、多链接实体）打分，达到阈值即拦截。
+* **AI 层（推荐开启）**：绑定 Workers AI 后，评分处于灰区的消息交由大模型语义仲裁，显著降低误判。绑定方法：Worker **Settings → Bindings → Add → Workers AI**，变量名填 `AI`（或在 `wrangler.toml` 中添加 `[ai]` + `binding = "AI"`）。
+* **拦截动作**：向用户发送警告（含违规原因），消息不转发；同时在你群组对应用户的话题内收到拦截通知（仅原因，不含原文）。累计 3 次自动封禁（可在 `worker.js` 顶部 `CONFIG.FILTER_STRIKE_LIMIT` 调整）。
+* **灰区降级**：AI 不可用时灰区消息照常转发，但会先在话题内向管理员提示可疑特征，由你自行甄别。
+
+### 可选：Webhook 加密校验
+
+设置环境变量 `WEBHOOK_SECRET`（任意随机字符串），并将激活 Webhook 的 URL 改为：
+
+```
+https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=<YOUR_WORKER_URL>&secret_token=<WEBHOOK_SECRET>
+```
+
+之后所有未携带正确密钥的伪造请求都会被直接拒绝（响应 403）。
 
 ---
 
