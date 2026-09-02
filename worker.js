@@ -288,7 +288,7 @@ async function resetUserVerificationAndRequireReverify(env, { userId, userKey, o
         reason
     });
 
-    await sendVerificationChallenge(userId, env, pendingMsgId || null);
+    await sendVerificationChallenge(userId, env, pendingMsgId || null, "");
 }
 
 function parseAdminIdAllowlist(env) {
@@ -531,7 +531,8 @@ async function handlePrivateMessage(msg, env, ctx) {
   if (!verified) {
     const isStart = msg.text && msg.text.trim() === "/start";
     const pendingMsgId = isStart ? null : msg.message_id;
-    await sendVerificationChallenge(userId, env, pendingMsgId);
+    const pendingText = isStart ? "" : extractMsgText(msg);
+    await sendVerificationChallenge(userId, env, pendingMsgId, pendingText);
     return;
   }
 
@@ -542,7 +543,7 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
     // 并发兜底：如果已被标记为需要重新验证，直接发起验证并暂停转发/建话题
     const needsVerify = await env.TOPIC_MAP.get(`needs_verify:${userId}`);
     if (needsVerify) {
-        await sendVerificationChallenge(userId, env, msg.message_id || null);
+        await sendVerificationChallenge(userId, env, msg.message_id || null, extractMsgText(msg));
         return;
     }
 
@@ -898,10 +899,10 @@ async function handleAdminReply(msg, env, ctx) {
 
 // ---------------- 验证模块 (纯本地) ----------------
 
-async function sendVerificationChallenge(userId, env, pendingMsgId) {
+async function sendVerificationChallenge(userId, env, pendingMsgId, pendingText) {
     // 优先使用 Cloudflare Turnstile 验证（配置 TURNSTILE_SITEKEY + TURNSTILE_SECRET 后生效）
     if (isTurnstileEnabled(env)) {
-        await sendTurnstileChallenge(userId, env, pendingMsgId);
+        await sendTurnstileChallenge(userId, env, pendingMsgId, pendingText);
         return;
     }
 
@@ -932,6 +933,10 @@ async function sendVerificationChallenge(userId, env, pendingMsgId) {
                     }
                     state.pending_ids = pendingIds;
                     delete state.pending;
+                    if (pendingText) {
+                        if (!state.pending_texts) state.pending_texts = {};
+                        state.pending_texts[String(pendingMsgId)] = pendingText;
+                    }
                     await env.TOPIC_MAP.put(chalKey, JSON.stringify(state), { expirationTtl: CONFIG.VERIFY_EXPIRE_SECONDS });
                 }
             }
@@ -968,6 +973,7 @@ async function sendVerificationChallenge(userId, env, pendingMsgId) {
         answerIndex: answerIndex,      // 存储索引
         options: challenge.options,     // 存储完整选项列表
         pending_ids: pendingMsgId ? [pendingMsgId] : [],
+        pending_texts: (pendingMsgId && pendingText) ? { [String(pendingMsgId)]: pendingText } : {},
         userId: userId                  // 添加用户ID验证
     };
 
@@ -1112,6 +1118,7 @@ async function handleCallbackQuery(query, env, ctx) {
                             message_id: pendingId,
                             chat: { id: userId, type: "private" },
                             from: query.from,
+                            text: (state.pending_texts && state.pending_texts[String(pendingId)]) || ""
                         };
 
                         await forwardToTopic(fakeMsg, userId, `user:${userId}`, env, ctx);
@@ -1171,7 +1178,7 @@ function isTurnstileEnabled(env) {
  * 打开 Worker 自托管的验证页完成 Cloudflare Turnstile 挑战。
  * 验证期间的消息 ID 暂存在 KV，验证通过后自动补发。
  */
-async function sendTurnstileChallenge(userId, env, pendingMsgId) {
+async function sendTurnstileChallenge(userId, env, pendingMsgId, pendingText) {
     // 进行中的验证只追加待发消息，不重复下发按钮（防止刷接口）
     const existingToken = await env.TOPIC_MAP.get(`user_challenge:${userId}`);
     if (existingToken) {
@@ -1188,6 +1195,10 @@ async function sendTurnstileChallenge(userId, env, pendingMsgId) {
                             : pendingIds;
                     }
                     state.pending_ids = pendingIds;
+                    if (pendingText) {
+                        if (!state.pending_texts) state.pending_texts = {};
+                        state.pending_texts[String(pendingMsgId)] = pendingText;
+                    }
                     await env.TOPIC_MAP.put(stateKey, JSON.stringify(state), { expirationTtl: CONFIG.TURNSTILE_LINK_TTL_SECONDS });
                 }
             }
@@ -1209,7 +1220,11 @@ async function sendTurnstileChallenge(userId, env, pendingMsgId) {
 
     // 生成一次性验证链接令牌（32 位加密随机串，5 分钟有效）
     const linkToken = secureRandomId(32);
-    const state = { userId, pending_ids: pendingMsgId ? [pendingMsgId] : [] };
+    const state = {
+        userId,
+        pending_ids: pendingMsgId ? [pendingMsgId] : [],
+        pending_texts: (pendingMsgId && pendingText) ? { [String(pendingMsgId)]: pendingText } : {}
+    };
     await env.TOPIC_MAP.put(`ts:${linkToken}`, JSON.stringify(state), { expirationTtl: CONFIG.TURNSTILE_LINK_TTL_SECONDS });
     await env.TOPIC_MAP.put(`user_challenge:${userId}`, linkToken, { expirationTtl: CONFIG.TURNSTILE_LINK_TTL_SECONDS });
 
@@ -1429,7 +1444,8 @@ async function handleTurnstileComplete(request, env, ctx) {
                 const fakeMsg = {
                     message_id: pendingId,
                     chat: { id: userId, type: "private" },
-                    from: { id: userId }
+                    from: { id: userId },
+                    text: (state.pending_texts && state.pending_texts[String(pendingId)]) || ""
                 };
                 await forwardToTopic(fakeMsg, userId, `user:${userId}`, env, ctx);
                 await env.TOPIC_MAP.put(forwardedKey, "1", { expirationTtl: 3600 });
@@ -1538,6 +1554,14 @@ const SPAM_PATTERNS = [
     { weight: 30, name: "字符刷屏", re: /(.)\1{6,}/ },
     { weight: 25, name: "表情刷屏", re: /(?:[\u{1F300}-\u{1FAFF}]\s*){6,}/u }
 ];
+
+/**
+ * 提取消息文本（用于暂存验证期间的消息内容，验证通过补发时做规则过滤）。
+ * 与 analyzeContentSignals 的文本提取口径保持一致：text 或 caption。
+ */
+function extractMsgText(msg) {
+    return ((msg && (msg.text || msg.caption)) || "").trim();
+}
 
 /**
  * 规则层：对消息做特征打分
