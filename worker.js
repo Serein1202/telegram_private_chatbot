@@ -1366,16 +1366,15 @@ async function handleTurnstileComplete(request, env, ctx) {
     }
     const userId = state.userId;
 
-    // 身份校验：携带 initData 时校验 HMAC 签名，防止代验/伪造
+    // 身份校验（软校验）：initData HMAC 校验失败时仅记录日志、不阻断流程。
+    // 安全性由一次性链接令牌（KV 绑定 userId、5 分钟过期）+ Turnstile siteverify 保证，
+    // initData 属于额外的第三层防线，参考 dydydd fork 的做法降级为可观察项。
     const initData = String(body.initData || "");
     if (initData) {
         const v = await validateTelegramInitData(env, initData, userId);
         if (!v.ok) {
-            Logger.warn('turnstile_initdata_invalid', { userId, reason: v.reason, detail: v.detail || null });
-            return jsonResp({ ok: false, message: `身份校验失败（${v.reason}${v.detail ? "；" + v.detail : ""}），请返回聊天窗口重新发送消息` }, 403);
+            Logger.warn('turnstile_initdata_invalid_soft', { userId, reason: v.reason, detail: v.detail || null });
         }
-    } else {
-        Logger.warn('turnstile_initdata_missing', { userId });
     }
 
     // 调用 Cloudflare siteverify
