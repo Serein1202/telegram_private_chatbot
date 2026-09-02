@@ -30,11 +30,14 @@ const CONFIG = {
     FILTER_GRAY_SCORE: 20,               // 达到该值进入灰区，交给 AI 仲裁
     FILTER_STRIKE_LIMIT: 3,              // 累计违规达到该次数自动封禁
     FILTER_STRIKE_TTL_SECONDS: 604800,   // 违规计数窗口 7 天
-    // AI 仲裁模型回退列表：依次尝试，第一个成功即用（防止单一模型被下线导致灰区仲裁失效）
+    // AI 仲裁模型回退列表：依次尝试，第一个成功即用
+    // 2026-05-30 Cloudflare 退役了 llama-3.1/3.3 等基础版模型，-fast 变体仍存活；
+    // 官方推荐替代：glm-4.7-flash（快、中文好）、gemma-4-26b。注意 kimi/GLM-5.2/deepseek 需付费计划，勿用。
     AI_MODELS: [
-        "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-        "@cf/meta/llama-4-scout-17b-16e-instruct",
-        "@cf/meta/llama-3.1-8b-instruct"
+        "@cf/zai-org/glm-4.7-flash",
+        "@cf/meta/llama-3.1-8b-instruct-fast",
+        "@cf/google/gemma-4-26b-a4b-it",
+        "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
     ]
 };
 
@@ -677,7 +680,7 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
         try {
             await tgCall(env, "sendMessage", withMessageThreadId({
                 chat_id: env.SUPERGROUP_ID,
-                text: `⚠️ **可疑消息提醒**\n用户: [${userId}](tg://user?id=${userId})\n特征: ${filterResult.reasons.slice(0, 3).join("、")}\n（AI 仲裁失败: ${filterResult.aiError || "未知原因"}，请自行甄别下方消息）`,
+                text: `⚠️ **可疑消息提醒**\n用户: [${userId}](tg://user?id=${userId})\n特征: ${filterResult.reasons.slice(0, 3).join("、")}\n（AI 仲裁失败: ${String(filterResult.aiError || "未知原因").slice(0, 200)}，请自行甄别下方消息）`,
                 parse_mode: "Markdown"
             }, rec.thread_id));
         } catch (e) {
@@ -1587,13 +1590,13 @@ function analyzeContentSignals(msg) {
 }
 
 /**
- * AI 层：Workers AI（llama）对灰区消息做语义仲裁。
+ * AI 层：Workers AI 对灰区消息做语义仲裁。
  * 依次尝试 AI_MODELS 中的模型，任一成功即返回判定结果。
- * 全部失败时返回 { error: 具体原因 }，交由调用方降级处理并透出错误信息。
+ * 全部失败时返回 { error: 所有模型的失败原因汇总 }，交由调用方降级处理并透出错误信息。
  */
 async function aiClassifySpam(env, text) {
     if (!env.AI) return { error: "AI binding 未绑定" };
-    let lastErr = "";
+    const errors = [];
     for (const model of CONFIG.AI_MODELS) {
         try {
             const result = await env.AI.run(model, {
@@ -1612,16 +1615,16 @@ async function aiClassifySpam(env, text) {
             ).trim();
             const match = raw.match(/\{[\s\S]*\}/);
             if (!match) {
-                lastErr = `${model} 响应无法解析: ${raw.slice(0, 80)}`;
+                errors.push(`${model} 响应无法解析: ${raw.slice(0, 60)}`);
                 continue;
             }
             const parsed = JSON.parse(match[0]);
             return { spam: !!parsed.spam, reason: parsed.reason || "" };
         } catch (e) {
-            lastErr = `${model}: ${e instanceof Error ? e.message : String(e)}`;
+            errors.push(`${model}: ${(e instanceof Error ? e.message : String(e)).slice(0, 100)}`);
         }
     }
-    return { error: lastErr || "AI 无响应" };
+    return { error: errors.join(" | ") || "AI 无响应" };
 }
 
 /**
