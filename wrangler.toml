@@ -2,17 +2,23 @@ name = "telegram_private_chatbot"
 main = "worker.js"
 compatibility_date = "2024-11-30"
 
-# 注意：KV 命名空间 ID 每个用户都不一样，
-# 所以不能写死在这里。用户需要在 Cloudflare 后台手动绑定。
+# 【重要】Git 连接部署时，本文件就是 Worker 配置的唯一事实来源。
+# 每次从 GitHub 触发部署，Cloudflare 都会用这里的配置覆盖后台设置——
+# 不在这里声明的绑定会被删除。因此 KV 绑定必须写在下面，而不是只在后台配置。
+keep_vars = true
 
-# ---- v5.4 可选配置 ----
+# KV 绑定：请把 id 替换为你自己的 KV 命名空间 ID
+# （后台 Storage & Databases -> KV -> 点进 TOPIC_MAP 命名空间 -> 复制 ID）
+[[kv_namespaces]]
+binding = "TOPIC_MAP"
+id = "5fa2dd14a6414d428ad8ab30309f678b"
 
-# 智能内容过滤：推荐绑定 Workers AI（对灰区消息做语义仲裁，降低误判）
-# [ai]
-# binding = "AI"
+# 智能内容过滤：绑定 Workers AI（对灰区消息做语义仲裁，降低误判）
+[ai]
+binding = "AI"
 
 # 建议在 Cloudflare 后台 Worker Settings -> Variables 中配置：
-#   必需：BOT_TOKEN、SUPERGROUP_ID、KV 绑定 TOPIC_MAP
+#   必需：BOT_TOKEN、SUPERGROUP_ID（keep_vars = true 可保护这些变量不被部署清除）
 #   Turnstile 验证（可选）：TURNSTILE_SITEKEY、TURNSTILE_SECRET（设为 Secret）
 #   自定义域名时：PUBLIC_BASE_URL（如 https://chat.example.com）
 #   Webhook 加密（可选）：WEBHOOK_SECRET（配合 setWebhook 的 secret_token 参数）
