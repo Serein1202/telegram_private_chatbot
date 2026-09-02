@@ -664,7 +664,7 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
             // 通知失败不影响主流程
         }
         Logger.info('content_blocked', { userId, reasons: filterResult.reasons, strikes });
-        return;
+        return "blocked";
     }
     if (filterResult.action === "flag") {
         // 灰区消息：命中中危特征，照常转发，但提前向管理员提示可疑特征以便甄别
@@ -685,7 +685,7 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
             targetChat: env.SUPERGROUP_ID,
             threadId: rec.thread_id
         });
-        return;
+        return filterResult.action;
     }
 
     const res = await tgCall(env, "forwardMessage", {
@@ -789,6 +789,8 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
             message_thread_id: rec.thread_id
         });
     }
+
+    return filterResult.action;
 }
 
 async function handleAdminReply(msg, env, ctx) {
@@ -1121,9 +1123,11 @@ async function handleCallbackQuery(query, env, ctx) {
                             text: (state.pending_texts && state.pending_texts[String(pendingId)]) || ""
                         };
 
-                        await forwardToTopic(fakeMsg, userId, `user:${userId}`, env, ctx);
+                        const fwdResult = await forwardToTopic(fakeMsg, userId, `user:${userId}`, env, ctx);
                         await env.TOPIC_MAP.put(forwardedKey, "1", { expirationTtl: 3600 });
-                        forwardedCount++;
+                        if (fwdResult === "pass" || fwdResult === "flag") {
+                            forwardedCount++;
+                        }
                     }
 
                     if (forwardedCount > 0) {
@@ -1447,9 +1451,11 @@ async function handleTurnstileComplete(request, env, ctx) {
                     from: { id: userId },
                     text: (state.pending_texts && state.pending_texts[String(pendingId)]) || ""
                 };
-                await forwardToTopic(fakeMsg, userId, `user:${userId}`, env, ctx);
+                const fwdResult = await forwardToTopic(fakeMsg, userId, `user:${userId}`, env, ctx);
                 await env.TOPIC_MAP.put(forwardedKey, "1", { expirationTtl: 3600 });
-                forwardedCount++;
+                if (fwdResult === "pass" || fwdResult === "flag") {
+                    forwardedCount++;
+                }
             }
             if (forwardedCount > 0) {
                 await tgCall(env, "sendMessage", {
