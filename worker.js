@@ -1502,11 +1502,16 @@ async function validateTelegramInitData(env, initData, expectedUserId) {
         const calcBuf = await crypto.subtle.sign("HMAC", secretKey, enc.encode(dataCheckString));
         const calc = [...new Uint8Array(calcBuf)].map(b => b.toString(16).padStart(2, "0")).join("");
         if (calc !== hash) {
-            // 详细输出便于线上比对：expected_hash、computed_hash、data_check_string 前 80 字符
+            // 详细输出便于线上比对：
+            // - initData 原文前 200 字符（看是否被修改）
+            // - 期望 hash 与计算 hash 前 12 字符
+            // - data_check_string 完整内容（把 \n 替换为 | 以便单行显示）
+            const safeInit = (initData || "").slice(0, 200);
+            const safeDcs = dataCheckString.replace(/\n/g, "|");
             return {
                 ok: false,
                 reason: "hmac_mismatch",
-                detail: `expected=${hash.slice(0,8)}..calc=${calc.slice(0,8)}..dcs=${dataCheckString.slice(0,80)}`
+                detail: `exp=${hash.slice(0,12)} calc=${calc.slice(0,12)} dcs[${safeDcs.length}]=${safeDcs.slice(0,160)} init[${initData.length}]=${safeInit}`
             };
         }
         return { ok: true };
