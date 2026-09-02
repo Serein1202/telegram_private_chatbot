@@ -22,3 +22,19 @@ binding = "AI"
 #   Turnstile 验证（可选）：TURNSTILE_SITEKEY、TURNSTILE_SECRET（设为 Secret）
 #   自定义域名时：PUBLIC_BASE_URL（如 https://chat.example.com）
 #   Webhook 加密（可选）：WEBHOOK_SECRET（配合 setWebhook 的 secret_token 参数）
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+redact_query_string = false
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
