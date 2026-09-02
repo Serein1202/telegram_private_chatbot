@@ -1478,10 +1478,15 @@ async function validateTelegramInitData(env, initData, expectedUserId) {
             if (Number(u.id) !== Number(expectedUserId)) return { ok: false, reason: "user_mismatch", detail: `initData_uid=${u.id} expected=${expectedUserId}` };
         }
 
+        // 【修复 #29】排除 hash 与 signature（Telegram 直链启动 Mini App 时 initData 会附带 signature）
+        // 官方算法要求：构造 data-check-string 时 hash 和 signature 都必须从输入中移除
+        params.delete("hash");
+        params.delete("signature");
+
+        // data_check_string = 按 key 排序的 "k=v" 列表，用 \n 连接
         const dataCheckString = [...params.entries()]
-            .filter(([k]) => k !== "hash")
+            .sort(([a], [b]) => a.localeCompare(b))
             .map(([k, v]) => `${k}=${v}`)
-            .sort()
             .join("\n");
 
         const enc = new TextEncoder();
