@@ -1008,7 +1008,7 @@ async function handleAdminReply(msg, env, ctx) {
       const banStatus = await env.TOPIC_MAP.get(`banned:${userId}`);
 
       const safeTitle = (userRec?.title || "未知").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-      const info = `<b>👤 用户信息</b>\nUID: <code>${userId}</code>\nTopic ID: <code>${threadId}</code>\n话题标题: ${safeTitle}\n验证状态: ${verifyStatus ? (verifyStatus === 'trusted' ? '🌟 永久信任' : '✅ 已验证') : '❌ 未验证'}\n封禁状态: ${banStatus ? '🚫 已封禁' : '✅ 正常'}\nLink: <a href="tg://user?id=${userId}">点击私聊</a>`;
+      const info = `<b>👤 用户信息</b>\nUID: <code>${userId}</code>\nTopic ID: <code>${threadId}</code>\n话题标题: ${safeTitle}\n验证状态: ${verifyStatus ? (verifyStatus === 'trusted' ? '🌟 永久信任' : '✅ 已验证') : '❌ 未验证'}\n封禁状态: ${banStatus ? '🚫 已封禁' : '✅ 正常'}\nLink: [点击私聊](tg://user?id=${userId})`;
       await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: info, parse_mode: "HTML" });
       return;
   }
