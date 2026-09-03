@@ -68,6 +68,7 @@ v5.4 upgrades the local trivia quiz to **Cloudflare Turnstile** and adds **smart
 ```
 Stranger DMs → Turnstile human verification (embedded page) → content analysis (local rule scoring)
     → Normal message: forwarded to the admin topic
+    → Suspicious message: forwarded to the 【疑似异常信息】 (Suspicious) topic for review
     → Ad/abusive content: warn user + not forwarded + strike recorded (auto-ban after 3 strikes)
 ```
 
@@ -87,7 +88,7 @@ Stranger DMs → Turnstile human verification (embedded page) → content analys
 Before forwarding, every message is scored by local rules (keywords + regex + link entities) and then triaged:
 
 * **Block**: score reaches the threshold (default 60) — ads, lead-gen, scams and porn are blocked: the user is warned (with the reason), the message is not forwarded, and a strike is recorded. After 3 strikes the user is auto-banned (adjust `CONFIG.FILTER_STRIKE_LIMIT` at the top of `worker.js`).
-* **Flag**: score is in the gray zone (default 20~59) — the message is forwarded, but the admin is first notified in the topic with the suspicious signals to review.
+* **Flag**: score is in the gray zone (default 20~59) — the message is forwarded to a dedicated 【疑似异常信息】 (Suspicious) topic (auto-created if missing), together with the user info and matched signals, for centralized review.
 * **Pass**: score below threshold — forwarded normally.
 
 Rules live in `worker.js`: `SPAM_RULE_GROUPS` (keyword weights) and `SPAM_PATTERNS` (regex features); thresholds are `FILTER_BLOCK_SCORE` / `FILTER_GRAY_SCORE` in the top `CONFIG`.

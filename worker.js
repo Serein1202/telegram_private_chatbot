@@ -27,7 +27,8 @@ const CONFIG = {
     FILTER_BLOCK_SCORE: 60,             // 规则评分达到该值直接拦截
     FILTER_GRAY_SCORE: 20,               // 达到该值进入灰区（转发但提醒管理员甄别）
     FILTER_STRIKE_LIMIT: 3,              // 累计违规达到该次数自动封禁
-    FILTER_STRIKE_TTL_SECONDS: 604800   // 违规计数窗口 7 天
+    FILTER_STRIKE_TTL_SECONDS: 604800,   // 违规计数窗口 7 天
+    ANOMALY_TOPIC_TITLE: "疑似异常信息"    // 灰区消息统一收容的话题标题
 };
 
 // 线程健康检查缓存，减少频繁探测请求
@@ -36,6 +37,8 @@ const threadHealthCache = new Map();
 const topicCreateInFlight = new Map();
 // 管理员权限缓存（实例内）
 const adminStatusCache = new Map();
+// 【疑似异常信息】话题在 KV 中的 key（全局唯一，非 per-user）
+const ANOMALY_TOPIC_KEY = "anomaly_topic";
 
 // --- 本地题库 (15条) ---
 const LOCAL_QUESTIONS = [
@@ -203,6 +206,67 @@ async function getOrCreateUserTopicRec(from, key, env, userId) {
         if (topicCreateInFlight.get(String(userId)) === p) {
             topicCreateInFlight.delete(String(userId));
         }
+    }
+}
+
+/**
+ * 获取或创建【疑似异常信息】话题的 thread_id：
+ * - 灰区（flag）消息统一转发至此，便于管理员集中甄别；
+ * - 话题不存在时自动创建，并将 thread_id 持久化到 KV（全局唯一，非 per-user）；
+ * - 复用 topicCreateInFlight（哨兵 key __anomaly__）做同实例并发保护，避免重复建话题。
+ * @returns {Promise<number>} 异常话题的 message_thread_id
+ */
+async function getOrCreateAnomalyTopic(env) {
+    const cached = await safeGetJSON(env, ANOMALY_TOPIC_KEY, null);
+    if (cached && cached.thread_id) return cached.thread_id;
+
+    const inflight = topicCreateInFlight.get("__anomaly__");
+    if (inflight) return await inflight;
+
+    const p = (async () => {
+        // 并发下二次确认，避免其他请求已创建却读到旧值
+        const again = await safeGetJSON(env, ANOMALY_TOPIC_KEY, null);
+        if (again && again.thread_id) return again.thread_id;
+
+        const res = await tgCall(env, "createForumTopic", {
+            chat_id: env.SUPERGROUP_ID,
+            name: CONFIG.ANOMALY_TOPIC_TITLE
+        });
+        if (!res.ok) throw new Error(`创建【${CONFIG.ANOMALY_TOPIC_TITLE}】话题失败: ${res.description}`);
+        const threadId = res.result.message_thread_id;
+        await env.TOPIC_MAP.put(ANOMALY_TOPIC_KEY, JSON.stringify({ thread_id: threadId, title: CONFIG.ANOMALY_TOPIC_TITLE }));
+        Logger.info('anomaly_topic_created', { threadId });
+        return threadId;
+    })();
+
+    topicCreateInFlight.set("__anomaly__", p);
+    try {
+        return await p;
+    } finally {
+        if (topicCreateInFlight.get("__anomaly__") === p) {
+            topicCreateInFlight.delete("__anomaly__");
+        }
+    }
+}
+
+/**
+ * 将消息原文转发到【疑似异常信息】话题：
+ * 优先 forwardMessage，失败时降级 copyMessage；话题被删等异常会向上抛出，由调用方兜底。
+ */
+async function forwardToAnomalyTopic(msg, userId, env, threadId) {
+    const res = await tgCall(env, "forwardMessage", {
+        chat_id: env.SUPERGROUP_ID,
+        from_chat_id: userId,
+        message_id: msg.message_id,
+        message_thread_id: threadId
+    });
+    if (!res.ok) {
+        await tgCall(env, "copyMessage", {
+            chat_id: env.SUPERGROUP_ID,
+            from_chat_id: userId,
+            message_id: msg.message_id,
+            message_thread_id: threadId
+        });
     }
 }
 
@@ -676,16 +740,34 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
         return "blocked";
     }
     if (filterResult.action === "flag") {
-        // 灰区消息：命中中危特征，照常转发，但提前向管理员提示可疑特征以便甄别
+        // 灰区消息：命中中危特征，统一转发到【疑似异常信息】话题（自动创建），
+        // 不再进入用户自己的话题，便于管理员集中甄别。
         try {
+            const anomalyThreadId = await getOrCreateAnomalyTopic(env);
+
+            // 在异常话题内先发一条甄别提醒（含用户信息与命中特征）
             await tgCall(env, "sendMessage", withMessageThreadId({
                 chat_id: env.SUPERGROUP_ID,
-                text: `⚠️ **可疑消息提醒**\n用户: [${userId}](tg://user?id=${userId})\n特征: ${filterResult.reasons.slice(0, 3).join("、")}\n（命中可疑特征，请自行甄别下方消息）`,
+                text: `⚠️ **可疑消息提醒**\n用户: [${userId}](tg://user?id=${userId})\n特征: ${filterResult.reasons.slice(0, 3).join("、")}\n\n（原文如下，请甄别）`,
                 parse_mode: "Markdown"
-            }, rec.thread_id));
+            }, anomalyThreadId));
+
+            // 转发原文到异常话题
+            if (msg.media_group_id) {
+                await handleMediaGroup(msg, env, ctx, {
+                    direction: "p2t",
+                    targetChat: env.SUPERGROUP_ID,
+                    threadId: anomalyThreadId
+                });
+            } else {
+                await forwardToAnomalyTopic(msg, userId, env, anomalyThreadId);
+            }
         } catch (e) {
-            // 提示失败不影响转发
+            Logger.error('anomaly_forward_failed', e, { userId });
+            // 异常话题失效（如被管理员删除）时清理缓存，下次消息自动重建
+            try { await env.TOPIC_MAP.delete(ANOMALY_TOPIC_KEY); } catch (_) {}
         }
+        return "flag";
     }
 
     if (msg.media_group_id) {
